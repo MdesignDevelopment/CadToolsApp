@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>CadToolsApp</AssemblyName>
+    <RootNamespace>CadToolsApp</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="netDxf" Version="3.0.1" />
+    <PackageReference Include="ProjNet" Version="2.0.0" />
+  </ItemGroup>
+</Project>
