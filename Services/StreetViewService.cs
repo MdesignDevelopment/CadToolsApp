@@ -11,9 +11,29 @@ namespace CadToolsApp.Services
 {
     public class StreetViewService
     {
-        private const string API_KEY  = "AIzaSyCpIh6orVGk2GmhMytDM2FDQxjmvoNd5Hw";
         private const string IMG_SIZE = "640x640";
         private const int    IMG_FOV  = 120;
+
+        private static readonly string API_KEY = LoadApiKey();
+
+        private static string LoadApiKey()
+        {
+            string path = Path.Combine(AppContext.BaseDirectory, "config.txt");
+            if (!File.Exists(path))
+                throw new FileNotFoundException(
+                    $"config.txt not found next to the exe.\n" +
+                    $"Create it at: {path}\n" +
+                    $"Contents: STREETVIEW_API_KEY=your_key_here");
+
+            foreach (string line in File.ReadAllLines(path))
+            {
+                if (line.StartsWith("STREETVIEW_API_KEY=", StringComparison.OrdinalIgnoreCase))
+                    return line.Substring("STREETVIEW_API_KEY=".Length).Trim();
+            }
+
+            throw new InvalidOperationException(
+                "config.txt exists but is missing the STREETVIEW_API_KEY= line.");
+        }
 
         private static readonly HttpClient _http = new HttpClient();
 
