@@ -7,7 +7,9 @@ using CadToolsApp.Models;
 using netDxf;
 using netDxf.Blocks;
 using netDxf.Entities;
+using netDxf.Objects;
 using netDxf.Tables;
+using netDxf.Units;
 
 namespace CadToolsApp.Services
 {
@@ -54,27 +56,41 @@ namespace CadToolsApp.Services
                 {
                     int id = pts.Count + 1;
                     pts.Add((id, x.Value, y.Value));
-                    StreetViewService.StoreSectionCoords(id, x.Value, y.Value);
                 }
             }
 
-            return pts.Select(p => new SectionInfo(
-                p.id,
-                Path.Combine(folder, $"section_{p.id:D3}_left.jpg"),
-                Path.Combine(folder, $"section_{p.id:D3}_right.jpg")
-            )).ToList();
+            var result = new List<SectionInfo>();
+            foreach (var p in pts)
+            {
+                var (lat, lon) = StreetViewService.ToWgs84(p.x, p.y);
+                var sec = new SectionInfo(p.id, lat, lon);
+                string imgPath = Path.Combine(folder, $"section_{p.id:D3}.jpg");
+                if (File.Exists(imgPath)) sec.ImagePath = imgPath;
+                result.Add(sec);
+            }
+            return result;
         }
 
         // ── Draw cross-section into doc ────────────────────────────────────────
         public void DrawCrossSection(DxfDocument doc, string sectionId,
             List<LayoutZone> zones, double ox, double oy,
-            string? templateDxfPath = null)
+            string? layoutTemplatePath = null, string? iconsTemplatePath = null,
+            string? photoImagePath = null)
         {
-            if (!string.IsNullOrEmpty(templateDxfPath) && File.Exists(templateDxfPath))
-                ImportTemplateBlocks(doc, templateDxfPath);
+            var layer = EnsureLayer(doc, SECTION_LAYER, 7);
+
+            // Photo area position defaults to "not set" (w=0 means skip)
+            var photoPos = Vector3.Zero;
+            double photoW = 0, photoH = 0;
+
+            if (!string.IsNullOrEmpty(layoutTemplatePath) && File.Exists(layoutTemplatePath))
+                (photoPos, photoW, photoH) =
+                    InsertLayoutTemplate(doc, layer, layoutTemplatePath, ox, oy);
+
+            if (!string.IsNullOrEmpty(iconsTemplatePath) && File.Exists(iconsTemplatePath))
+                ImportTemplateBlocks(doc, iconsTemplatePath);
 
             EnsureXsecBlocks(doc);
-            var layer = EnsureLayer(doc, SECTION_LAYER, 7);
 
             DrawXsecView(doc, layer, ox, oy, sectionId, zones,
                 "Situatie vóór de werken");
@@ -87,6 +103,9 @@ namespace CadToolsApp.Services
 
             DrawXsecView(doc, layer, ox, gedY, sectionId, zones,
                 "Situatie gedurende de werken");
+
+            if (!string.IsNullOrEmpty(photoImagePath) && File.Exists(photoImagePath) && photoW > 0)
+                TryInsertPhoto(doc, layer, photoImagePath, photoPos, photoW, photoH);
         }
 
         // ── Apply layer cleanup ────────────────────────────────────────────────
@@ -290,6 +309,7 @@ namespace CadToolsApp.Services
             EnsureBlock(doc, "XSEC_VOETPAD",    (_) => { });
             EnsureBlock(doc, "XSEC_RIJBAAN_F",  CreateRijbaan);
             EnsureBlock(doc, "XSEC_RIJBAAN_B",  CreateRijbaanB);
+            EnsureBlock(doc, "XSEC_PARKING",    CreateParking);
         }
 
         private static void EnsureBlock(DxfDocument doc, string name,
@@ -369,8 +389,126 @@ namespace CadToolsApp.Services
             b.Entities.Add(BLine(-0.62, 0.87,-0.30, 1.34));
         }
 
+        private static void CreateParking(Block b)
+        {
+            // Vertical stem of P
+            b.Entities.Add(BLine(0.15, 0.00, 0.15, 1.40));
+            // Top horizontal
+            b.Entities.Add(BLine(0.15, 1.40, 0.65, 1.40));
+            // Right arc of P (approximated with lines)
+            b.Entities.Add(BLine(0.65, 1.40, 0.85, 1.20));
+            b.Entities.Add(BLine(0.85, 1.20, 0.85, 0.85));
+            b.Entities.Add(BLine(0.85, 0.85, 0.65, 0.70));
+            // Mid horizontal closing the bump
+            b.Entities.Add(BLine(0.65, 0.70, 0.15, 0.70));
+        }
+
         private static Line BLine(double x1, double y1, double x2, double y2) =>
             new Line(new Vector3(x1, y1, 0), new Vector3(x2, y2, 0));
+
+        // ── Insert layout template (frame, logo, title) at origin ─────────────
+        // Returns the photo area position and size found in the template via XSEC_PHOTO_AREA.
+        private static (Vector3 photoPos, double photoW, double photoH) InsertLayoutTemplate(
+            DxfDocument doc, Layer layer, string templatePath, double ox, double oy)
+        {
+            const string BLOCK_NAME = "XSEC_LAYOUT";
+            var photoPos = Vector3.Zero;
+            double photoW = 0, photoH = 0;
+
+            try
+            {
+                var src = DxfDocument.Load(templatePath);
+
+                // Find XSEC_PHOTO_AREA placeholder to get image position/size
+                foreach (var ins in src.Entities.Inserts)
+                {
+                    if (!ins.Block.Name.Equals("XSEC_PHOTO_AREA",
+                            StringComparison.OrdinalIgnoreCase)) continue;
+
+                    photoPos = new Vector3(ox + ins.Position.X, oy + ins.Position.Y, 0);
+                    photoW   = ins.Scale.X > 0 ? ins.Scale.X : 6.0;
+                    photoH   = ins.Scale.Y > 0 ? ins.Scale.Y : 4.0;
+                    break;
+                }
+
+                if (!doc.Blocks.Contains(BLOCK_NAME))
+                {
+                    var block = new Block(BLOCK_NAME);
+                    foreach (var e in src.Entities.All)
+                    {
+                        // Skip the placeholder — actual image replaces it
+                        if (e is Insert ins2 && ins2.Block.Name.Equals("XSEC_PHOTO_AREA",
+                                StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        EntityObject? copy = e switch
+                        {
+                            Line l       => new Line(l.StartPoint, l.EndPoint),
+                            Circle c     => new Circle(c.Center, c.Radius),
+                            Arc a        => new Arc(a.Center, a.Radius, a.StartAngle, a.EndAngle),
+                            Polyline2D p => ClonePolyline2D(p),
+                            Text t       => new Text(t.Value, t.Position, t.Height)
+                                            { Alignment = t.Alignment, Rotation = t.Rotation },
+                            MText m      => new MText(m.Value, m.Position, m.Height, m.RectangleWidth),
+                            _            => null,
+                        };
+                        if (copy != null) block.Entities.Add(copy);
+                    }
+                    doc.Blocks.Add(block);
+                }
+
+                doc.Entities.Add(new Insert(doc.Blocks[BLOCK_NAME], new Vector3(ox, oy, 0))
+                {
+                    Layer = layer,
+                });
+            }
+            catch { /* skip on error */ }
+
+            return (photoPos, photoW, photoH);
+        }
+
+        // ── Insert captured street view image at the XSEC_PHOTO_AREA position ──
+        private static void TryInsertPhoto(DxfDocument doc, Layer layer,
+            string imagePath, Vector3 position, double w, double h)
+        {
+            try
+            {
+                string name = Path.GetFileNameWithoutExtension(imagePath);
+                if (!doc.ImageDefinitions.Contains(name))
+                {
+                    // 640×640 px @ 96 dpi matches StreetViewService image size
+                    var imgDef = new ImageDefinition(name, imagePath,
+                        640, 96.0, 640, 96.0, ImageResolutionUnits.Inches);
+                    doc.ImageDefinitions.Add(imgDef);
+                }
+
+                var img = new Image(doc.ImageDefinitions[name], position, w, h)
+                {
+                    Layer = layer,
+                };
+                doc.Entities.Add(img);
+            }
+            catch
+            {
+                // Fallback: rectangle with cross to mark where photo goes
+                double x = position.X, y = position.Y;
+                AddLine(doc, layer, x,     y,     x + w, y);
+                AddLine(doc, layer, x + w, y,     x + w, y + h);
+                AddLine(doc, layer, x + w, y + h, x,     y + h);
+                AddLine(doc, layer, x,     y + h, x,     y);
+                AddLine(doc, layer, x,     y,     x + w, y + h);
+                AddLine(doc, layer, x + w, y,     x,     y + h);
+                AddText(doc, layer, Path.GetFileName(imagePath),
+                    x + w / 2, y + h / 2, 0.25, center: true);
+            }
+        }
+
+        private static Polyline2D ClonePolyline2D(Polyline2D src)
+        {
+            var verts = src.Vertexes.Select(v =>
+                new Polyline2DVertex(v.Position) { Bulge = v.Bulge }).ToList();
+            return new Polyline2D(verts) { IsClosed = src.IsClosed };
+        }
 
         // ── Import XSEC_ blocks from a DXF template ────────────────────────────
         private static void ImportTemplateBlocks(DxfDocument doc, string templatePath)

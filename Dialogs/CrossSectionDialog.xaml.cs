@@ -4,10 +4,12 @@ using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media.Imaging;
 using CadToolsApp.Models;
+using CadToolsApp.Services;
 using Microsoft.Win32;
 
 namespace CadToolsApp.Dialogs
@@ -17,14 +19,16 @@ namespace CadToolsApp.Dialogs
         private readonly ObservableCollection<LayoutZone> _zones = new();
         private bool _sync;
         private bool _initialized;
+        private bool _webViewReady;
+        private SectionInfo? _pendingSection;
+        private readonly string _folder;
 
-        public string           SectionId         { get; private set; } = "";
-        public string           TemplatePath      { get; private set; } = "";
-        public SectionInfo?     SelectedSection   { get; private set; }
-        public string           SelectedImagePath { get; private set; } = "";
-        public double           InsertX           { get; private set; }
-        public double           InsertY           { get; private set; }
-        public List<LayoutZone> Zones             => _zones.ToList();
+        public string           SectionId        { get; private set; } = "";
+        public SectionInfo?     SelectedSection  { get; private set; }
+        public string           SelectedImagePath => SelectedSection?.ImagePath ?? "";
+        public double           InsertX          { get; private set; }
+        public double           InsertY          { get; private set; }
+        public List<LayoutZone> Zones            => _zones.ToList();
 
         private static readonly ZonePreset[] FullPresets =
         {
@@ -65,7 +69,7 @@ namespace CadToolsApp.Dialogs
         private static readonly ZoneType[] FullTypes =
         {
             ZoneType.Berm, ZoneType.BermTrees, ZoneType.Fietspad,
-            ZoneType.Voetpad, ZoneType.RijbaanFront, ZoneType.RijbaanBack,
+            ZoneType.Voetpad, ZoneType.RijbaanFront, ZoneType.RijbaanBack, ZoneType.Parking,
         };
 
         private static readonly ZoneType[] SideTypes =
@@ -73,77 +77,199 @@ namespace CadToolsApp.Dialogs
             ZoneType.Berm, ZoneType.BermTrees, ZoneType.Fietspad, ZoneType.Voetpad,
         };
 
-        public CrossSectionDialog(IList<SectionInfo> sections, string templatePath)
+        public CrossSectionDialog(IList<SectionInfo> sections, string folder)
         {
             InitializeComponent();
+            _folder      = folder;
             _initialized = true;
-            UpdateImageBorders();
 
             lstZones.ItemsSource    = _zones;
             lstSections.ItemsSource = sections;
-            TemplatePath            = templatePath ?? "";
-            txtTemplate.Text        = TemplatePath;
 
             RebuildButtons(FullTypes);
             RebuildTypeCombo(FullTypes);
             ApplyPresets(FullPresets);
 
             if (sections.Count > 0) lstSections.SelectedIndex = 0;
+
+            Loaded += async (s, e) => await InitWebViewAsync();
         }
 
-        private void LstSections_Changed(object s, SelectionChangedEventArgs e)
-        {
-            if (lstSections.SelectedItem is not SectionInfo sec) return;
-            SelectedSection = sec;
-            if (string.IsNullOrWhiteSpace(txtId.Text) || txtId.Text.StartsWith("Section "))
-                txtId.Text = sec.ToString();
+        // ── WebView2 initialisation ───────────────────────────────────────────
 
-            imgLeft.Source  = TryLoadBitmap(sec.LeftImagePath);
-            imgRight.Source = TryLoadBitmap(sec.RightImagePath);
-            UpdateSelectedImagePath();
-        }
-
-        private static BitmapImage? TryLoadBitmap(string path)
+        private async Task InitWebViewAsync()
         {
-            if (!File.Exists(path)) return null;
             try
             {
-                var bi = new BitmapImage();
-                bi.BeginInit();
-                bi.UriSource   = new Uri(path);
-                bi.CacheOption = BitmapCacheOption.OnLoad;
-                bi.EndInit();
-                return bi;
+                await webView.EnsureCoreWebView2Async(null);
+                webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
+                webView.CoreWebView2.Settings.AreDevToolsEnabled = false;
+                _webViewReady = true;
+                btnCapture.IsEnabled = true;
+                if (_pendingSection != null) LoadPanorama(_pendingSection);
             }
-            catch { return null; }
+            catch
+            {
+                lblCaptureStatus.Text =
+                    "Street View viewer unavailable (WebView2 runtime not found).";
+            }
         }
 
-        private void ImgLeft_Click(object sender, System.Windows.Input.MouseButtonEventArgs e)
+        private void LoadPanorama(SectionInfo sec)
         {
-            if (!_initialized) return;
-            rbImgLeft.IsChecked = true;
-            if (e.ClickCount == 2) ShowPreview(SelectedSection?.LeftImagePath, "Left view — Street View");
+            _pendingSection = null;
+            webView.NavigateToString(BuildStreetViewHtml(sec.Lat, sec.Lon));
+            lblCaptureStatus.Text = "Drag to look around, then click Capture.";
         }
 
-        private void ImgRight_Click(object sender, System.Windows.Input.MouseButtonEventArgs e)
+        private static string BuildStreetViewHtml(double lat, double lon)
         {
-            if (!_initialized) return;
-            rbImgRight.IsChecked = true;
-            if (e.ClickCount == 2) ShowPreview(SelectedSection?.RightImagePath, "Right view — Street View");
+            string latStr = lat.ToString(CultureInfo.InvariantCulture);
+            string lonStr = lon.ToString(CultureInfo.InvariantCulture);
+            string key    = StreetViewService.ApiKey;
+
+            return $@"<!DOCTYPE html><html><head>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+html,body{{width:100%;height:100%;overflow:hidden;position:relative}}
+#sv{{width:100%;height:100%}}
+#ov{{position:absolute;top:0;left:0;width:100%;height:100%;z-index:20;pointer-events:none}}
+.mask{{position:absolute;background:rgba(0,0,0,0.55);pointer-events:none}}
+#fr{{position:absolute;border:2px solid #fff;cursor:move;pointer-events:all;
+     z-index:21;user-select:none}}
+#rsz{{position:absolute;bottom:2px;right:2px;width:16px;height:16px;
+      cursor:nwse-resize;background:#fff;opacity:0.85;border-radius:2px}}
+#lbl{{position:absolute;bottom:4px;left:4px;color:#fff;font:11px sans-serif;
+      background:rgba(0,0,0,0.5);padding:2px 5px;border-radius:2px;pointer-events:none}}
+</style></head><body>
+<div id='sv'></div>
+<div id='ov'>
+  <div id='mT' class='mask' style='top:0;left:0;width:100%'></div>
+  <div id='mB' class='mask' style='left:0;width:100%;bottom:0'></div>
+  <div id='mL' class='mask' style='left:0'></div>
+  <div id='mR' class='mask' style='right:0'></div>
+  <div id='fr'>
+    <div id='rsz'></div>
+    <div id='lbl'>199 x 83</div>
+  </div>
+</div>
+<script>
+var AW=199,AH=83,BASE_FOV=120;
+var fw,fh,fx,fy;
+
+function initFrame(){{
+  fw=window.innerWidth*0.78;
+  fw=Math.min(fw,window.innerHeight*AW/AH);
+  fh=fw*AH/AW;
+  fx=(window.innerWidth-fw)/2;
+  fy=(window.innerHeight-fh)/2;
+  upd();
+}}
+
+function upd(){{
+  fw=Math.max(40,Math.min(window.innerWidth,Math.min(fw,window.innerHeight*AW/AH)));
+  fh=fw*AH/AW;
+  fx=Math.max(0,Math.min(window.innerWidth-fw,fx));
+  fy=Math.max(0,Math.min(window.innerHeight-fh,fy));
+  var fr=document.getElementById('fr');
+  fr.style.left=fx+'px';fr.style.top=fy+'px';fr.style.width=fw+'px';fr.style.height=fh+'px';
+  var mT=document.getElementById('mT'),mB=document.getElementById('mB');
+  var mL=document.getElementById('mL'),mR=document.getElementById('mR');
+  mT.style.height=fy+'px';
+  mB.style.top=(fy+fh)+'px';mB.style.height=(window.innerHeight-fy-fh)+'px';
+  mL.style.top=fy+'px';mL.style.height=fh+'px';mL.style.width=fx+'px';
+  var rx=fx+fw;
+  mR.style.top=fy+'px';mR.style.height=fh+'px';mR.style.left=rx+'px';
+  mR.style.width=(window.innerWidth-rx)+'px';
+}}
+
+window.addEventListener('resize',function(){{fw=Math.min(fw,window.innerWidth);upd();}});
+
+var drag=false,resz=false,sx,sy,ox,oy,ow;
+document.getElementById('fr').addEventListener('mousedown',function(e){{
+  if(e.target.id==='rsz'){{resz=true;sx=e.clientX;ow=fw;}}
+  else{{drag=true;sx=e.clientX;sy=e.clientY;ox=fx;oy=fy;}}
+  e.stopPropagation();e.preventDefault();
+}});
+document.addEventListener('mousemove',function(e){{
+  if(drag){{fx=ox+(e.clientX-sx);fy=oy+(e.clientY-sy);upd();}}
+  else if(resz){{fw=Math.max(60,ow+(e.clientX-sx));upd();}}
+}});
+document.addEventListener('mouseup',function(){{drag=false;resz=false;}});
+
+function getHeading(){{return window._pano?window._pano.getPov().heading:0;}}
+function getPitch(){{var cy=fy+fh/2;return(0.5-cy/window.innerHeight)*90;}}
+function getFov(){{return BASE_FOV*(fw/window.innerWidth);}}
+
+function initSV(){{
+  window._pano=new google.maps.StreetViewPanorama(document.getElementById('sv'),{{
+    position:{{lat:{latStr},lng:{lonStr}}},
+    pov:{{heading:0,pitch:0}},zoom:1,
+    addressControl:false,fullscreenControl:false,
+    motionTracking:false,motionTrackingControl:false
+  }});
+  initFrame();
+}}
+</script>
+<script src='https://maps.googleapis.com/maps/api/js?key={key}&callback=initSV' async></script>
+</body></html>";
         }
 
-        private void PreviewLeft_Click(object sender, RoutedEventArgs e)
-            => ShowPreview(SelectedSection?.LeftImagePath, "Left view — Street View");
+        // ── Capture ───────────────────────────────────────────────────────────
 
-        private void PreviewRight_Click(object sender, RoutedEventArgs e)
-            => ShowPreview(SelectedSection?.RightImagePath, "Right view — Street View");
+        private async void Capture_Click(object s, RoutedEventArgs e)
+        {
+            if (SelectedSection == null || !_webViewReady) return;
+            btnCapture.IsEnabled = false;
+            lblCaptureStatus.Text = "Downloading…";
 
-        private void ShowPreview(string? path, string title)
+            try
+            {
+                string hStr = await webView.CoreWebView2.ExecuteScriptAsync("getHeading()");
+                string pStr = await webView.CoreWebView2.ExecuteScriptAsync("getPitch()");
+                string fStr = await webView.CoreWebView2.ExecuteScriptAsync("getFov()");
+
+                double heading = double.Parse(hStr, CultureInfo.InvariantCulture);
+                double pitch   = double.Parse(pStr, CultureInfo.InvariantCulture);
+                double fov     = double.Parse(fStr, CultureInfo.InvariantCulture);
+
+                string savePath = Path.Combine(_folder, $"section_{SelectedSection.Id:D3}.jpg");
+                bool ok = await new StreetViewService().DownloadImageAsync(
+                    SelectedSection.Lat, SelectedSection.Lon, heading, pitch, fov, savePath);
+
+                if (ok)
+                {
+                    SelectedSection.ImagePath = savePath;
+                    imgCapture.Source = TryLoadBitmap(savePath);
+                    lblCaptureStatus.Text =
+                        $"Captured — heading {heading:F0}°  pitch {pitch:F1}°  fov {fov:F0}°";
+                }
+                else
+                {
+                    lblCaptureStatus.Text = "No Street View coverage at this location.";
+                }
+            }
+            catch (Exception ex)
+            {
+                lblCaptureStatus.Text = $"Error: {ex.Message}";
+            }
+            finally
+            {
+                btnCapture.IsEnabled = true;
+            }
+        }
+
+        private void Thumbnail_Click(object s, System.Windows.Input.MouseButtonEventArgs e)
+        {
+            if (e.ClickCount == 2)
+                ShowPreview(SelectedSection?.ImagePath);
+        }
+
+        private void ShowPreview(string? path)
         {
             if (string.IsNullOrEmpty(path) || !File.Exists(path))
             {
-                MessageBox.Show(
-                    "No image available.\nRun Street View first to download images.",
+                MessageBox.Show("No image captured yet. Use 'Capture this view' first.",
                     "No Preview", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
@@ -178,43 +304,52 @@ namespace CadToolsApp.Dialogs
 
             var win = new Window
             {
-                Title = title, Width = 1000, Height = 650,
+                Title  = "Street View — captured image",
+                Width  = 1000, Height = 650,
                 WindowStartupLocation = WindowStartupLocation.CenterScreen,
                 Background = System.Windows.Media.Brushes.Black,
                 Content    = grid, ResizeMode = ResizeMode.CanResize,
             };
-            win.KeyDown            += (_, e2) => { if (e2.Key == System.Windows.Input.Key.Escape) win.Close(); };
+            win.KeyDown             += (_, e2) => { if (e2.Key == System.Windows.Input.Key.Escape) win.Close(); };
             win.MouseLeftButtonDown += (_, _2) => win.Close();
             try { win.Owner = this; } catch { }
             win.ShowDialog();
         }
 
-        private void ImgSelection_Changed(object sender, RoutedEventArgs e)
+        // ── Section selection ─────────────────────────────────────────────────
+
+        private void LstSections_Changed(object s, SelectionChangedEventArgs e)
         {
-            if (!_initialized) return;
-            UpdateImageBorders();
-            UpdateSelectedImagePath();
+            if (lstSections.SelectedItem is not SectionInfo sec) return;
+            SelectedSection = sec;
+            if (string.IsNullOrWhiteSpace(txtId.Text) || txtId.Text.StartsWith("Section "))
+                txtId.Text = sec.ToString();
+
+            imgCapture.Source = TryLoadBitmap(sec.ImagePath);
+            lblCaptureStatus.Text = sec.ImagePath != null
+                ? "Previously captured — drag to re-capture if needed."
+                : "Drag to look around, then click Capture.";
+
+            if (_webViewReady) LoadPanorama(sec);
+            else _pendingSection = sec;
         }
 
-        private void UpdateImageBorders()
+        private static BitmapImage? TryLoadBitmap(string? path)
         {
-            if (borderLeft == null || borderRight == null || rbImgLeft == null) return;
-            bool left = rbImgLeft.IsChecked == true;
-            var sel   = new System.Windows.Media.SolidColorBrush(
-                            System.Windows.Media.Color.FromRgb(0x1E, 0x90, 0xFF));
-            var unsel = new System.Windows.Media.SolidColorBrush(
-                            System.Windows.Media.Color.FromRgb(0xAA, 0xAA, 0xAA));
-            borderLeft.BorderBrush  = left  ? sel : unsel;
-            borderRight.BorderBrush = !left ? sel : unsel;
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+            try
+            {
+                var bi = new BitmapImage();
+                bi.BeginInit();
+                bi.UriSource   = new Uri(path);
+                bi.CacheOption = BitmapCacheOption.OnLoad;
+                bi.EndInit();
+                return bi;
+            }
+            catch { return null; }
         }
 
-        private void UpdateSelectedImagePath()
-        {
-            if (SelectedSection == null) return;
-            bool left = rbImgLeft?.IsChecked == true;
-            SelectedImagePath = left ? SelectedSection.LeftImagePath
-                                     : SelectedSection.RightImagePath;
-        }
+        // ── Zone type toggle ──────────────────────────────────────────────────
 
         private void TypeChanged(object sender, RoutedEventArgs e)
         {
@@ -277,6 +412,8 @@ namespace CadToolsApp.Dialogs
             RefreshList();
             if (_zones.Count > 0) lstZones.SelectedIndex = 0;
         }
+
+        // ── Zone editor ───────────────────────────────────────────────────────
 
         private void LstZones_Changed(object s, SelectionChangedEventArgs e)
         {
@@ -341,19 +478,8 @@ namespace CadToolsApp.Dialogs
             lstZones.SelectedIndex = i + 1;
         }
 
-        private void Browse_Click(object s, RoutedEventArgs e)
-        {
-            var ofd = new OpenFileDialog
-            {
-                Title  = "Select template DXF/DWG with XSEC_* blocks",
-                Filter = "DXF Drawing (*.dxf)|*.dxf",
-            };
-            if (ofd.ShowDialog() == true)
-            {
-                TemplatePath     = ofd.FileName;
-                txtTemplate.Text = ofd.FileName;
-            }
-        }
+        // ── Template / insertion point ────────────────────────────────────────
+
 
         private void Draw_Click(object s, RoutedEventArgs e)
         {

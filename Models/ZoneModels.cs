@@ -5,7 +5,7 @@ namespace CadToolsApp.Models
 {
     public enum ZoneType
     {
-        Berm, BermTrees, Fietspad, Voetpad, RijbaanFront, RijbaanBack
+        Berm, BermTrees, Fietspad, Voetpad, RijbaanFront, RijbaanBack, Parking
     }
 
     public static class ZoneMeta
@@ -18,6 +18,7 @@ namespace CadToolsApp.Models
             ZoneType.Voetpad      => "Voetpad",
             ZoneType.RijbaanFront => "Rijbaan ↑",
             ZoneType.RijbaanBack  => "Rijbaan ↓",
+            ZoneType.Parking      => "Parking",
             _                     => t.ToString(),
         };
 
@@ -29,6 +30,7 @@ namespace CadToolsApp.Models
             ZoneType.Voetpad      => "Voetpad",
             ZoneType.RijbaanFront => "Rijbaan",
             ZoneType.RijbaanBack  => "Rijbaan",
+            ZoneType.Parking      => "Parking",
             _                     => t.ToString(),
         };
 
@@ -40,6 +42,7 @@ namespace CadToolsApp.Models
             ZoneType.Voetpad      => "XSEC_VOETPAD",
             ZoneType.RijbaanFront => "XSEC_RIJBAAN_F",
             ZoneType.RijbaanBack  => "XSEC_RIJBAAN_B",
+            ZoneType.Parking      => "XSEC_PARKING",
             _                     => null!,
         };
 
@@ -51,6 +54,7 @@ namespace CadToolsApp.Models
             ZoneType.Fietspad     => (1.6, 1.2),
             ZoneType.RijbaanFront => (2.2, 1.4),
             ZoneType.RijbaanBack  => (2.2, 1.4),
+            ZoneType.Parking      => (1.0, 1.4),
             _                     => (1.0, 1.0),
         };
 
@@ -62,6 +66,7 @@ namespace CadToolsApp.Models
             ZoneType.Voetpad      => 1.5,
             ZoneType.RijbaanFront => 3.0,
             ZoneType.RijbaanBack  => 3.0,
+            ZoneType.Parking      => 2.5,
             _                     => 2.0,
         };
     }
@@ -77,12 +82,13 @@ namespace CadToolsApp.Models
 
     public class SectionInfo
     {
-        public int    Id             { get; }
-        public string LeftImagePath  { get; }
-        public string RightImagePath { get; }
+        public int     Id        { get; }
+        public double  Lat       { get; }
+        public double  Lon       { get; }
+        public string? ImagePath { get; set; }
 
-        public SectionInfo(int id, string left, string right)
-        { Id = id; LeftImagePath = left; RightImagePath = right; }
+        public SectionInfo(int id, double lat, double lon)
+        { Id = id; Lat = lat; Lon = lon; }
 
         public override string ToString() => $"Section {Id:D3}";
     }
