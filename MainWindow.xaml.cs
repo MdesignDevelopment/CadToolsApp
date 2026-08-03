@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Threading.Tasks;
 using System.Windows;
 using CadToolsApp.Dialogs;
 using CadToolsApp.Models;
@@ -18,12 +17,17 @@ namespace CadToolsApp
         private string        _filePath = "";
         private readonly DxfService _dxf = new();
 
-        private static readonly string TemplateCfgPath =
-            Path.Combine(AppContext.BaseDirectory, "xsec_template.txt");
         private static readonly string CableMapCfgPath =
             Path.Combine(AppContext.BaseDirectory, "cable_map.txt");
-        private static readonly string LayoutTemplatePath =
+
+        // Two unrelated layout templates now: the sheet/quantity-table one used by Create Plans,
+        // and the cross-section pair (frame + icon blocks) used by Cross Section.
+        private static readonly string PlansLayoutTemplatePath =
             Path.Combine(AppContext.BaseDirectory, "Templates", "table_layout_template.dxf");
+        private static readonly string XsecLayoutTemplatePath =
+            Path.Combine(AppContext.BaseDirectory, "Templates", "xsec_layout.dxf");
+        private static readonly string XsecIconsTemplatePath =
+            Path.Combine(AppContext.BaseDirectory, "Templates", "xsec_icons.dxf");
 
         public MainWindow()
         {
@@ -82,35 +86,6 @@ namespace CadToolsApp
             }
         }
 
-        // ── Street View ──────────────────────────────────────────────────────
-        private async void StreetView_Click(object sender, RoutedEventArgs e)
-        {
-            if (_doc == null) return;
-            EnableButtons(false);
-            SetStatus("Fetching street view images…");
-
-            string folder = Path.GetDirectoryName(_filePath)!;
-            var sections  = _dxf.FindSectionPoints(_doc, folder);
-
-            if (sections.Count == 0)
-            {
-                Log("No section points found on 'Cross sections' layer.");
-                EnableButtons(true);
-                SetStatus("Done — no section points found.");
-                return;
-            }
-
-            Log($"Found {sections.Count} section point(s). Downloading images…");
-
-            var svc = new StreetViewService();
-            svc.Progress += msg => Dispatcher.Invoke(() => Log(msg));
-
-            await Task.Run(() => svc.FetchImages(sections, folder));
-
-            EnableButtons(true);
-            SetStatus("Street view done.");
-        }
-
         // ── Cross Section ─────────────────────────────────────────────────────
         private void CrossSection_Click(object sender, RoutedEventArgs e)
         {
@@ -120,22 +95,14 @@ namespace CadToolsApp
             var sections  = _dxf.FindSectionPoints(_doc, folder);
             Log($"Found {sections.Count} section point(s).");
 
-            string templatePath = "";
-            try { if (File.Exists(TemplateCfgPath)) templatePath = File.ReadAllText(TemplateCfgPath).Trim(); }
-            catch { }
-
-            var dlg = new CrossSectionDialog(sections, templatePath) { Owner = this };
+            var dlg = new CrossSectionDialog(sections, folder) { Owner = this };
             if (dlg.ShowDialog() != true) return;
-
-            if (!string.IsNullOrEmpty(dlg.TemplatePath))
-            {
-                try { File.WriteAllText(TemplateCfgPath, dlg.TemplatePath); } catch { }
-            }
 
             try
             {
                 _dxf.DrawCrossSection(_doc, dlg.SectionId, dlg.Zones,
-                    dlg.InsertX, dlg.InsertY, dlg.TemplatePath);
+                    dlg.InsertX, dlg.InsertY, XsecLayoutTemplatePath, XsecIconsTemplatePath,
+                    dlg.SelectedImagePath);
 
                 Log($"Cross-section '{dlg.SectionId}' drawn at ({dlg.InsertX}, {dlg.InsertY}).");
                 SetStatus("Cross-section added — click Save to write the file.");
@@ -183,9 +150,9 @@ namespace CadToolsApp
         {
             if (_doc == null) return;
 
-            if (!File.Exists(LayoutTemplatePath))
+            if (!File.Exists(PlansLayoutTemplatePath))
             {
-                MessageBox.Show($"Layout template not found:\n{LayoutTemplatePath}",
+                MessageBox.Show($"Layout template not found:\n{PlansLayoutTemplatePath}",
                     "Error", MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
@@ -215,7 +182,7 @@ namespace CadToolsApp
                     r.Evidence, false, false)).ToList();
 
                 SetStatus("Creating plans…");
-                var (ok, log) = _dxf.CreatePlans(_doc, LayoutTemplatePath, confirmed, dlg.Info, _filePath);
+                var (ok, log) = _dxf.CreatePlans(_doc, PlansLayoutTemplatePath, confirmed, dlg.Info, _filePath);
                 foreach (var line in log) Log(line);
 
                 if (ok)
@@ -238,7 +205,6 @@ namespace CadToolsApp
         // ── Helpers ───────────────────────────────────────────────────────────
         private void EnableButtons(bool on)
         {
-            btnStreetView.IsEnabled  = on && _doc != null;
             btnCrossSection.IsEnabled = on && _doc != null;
             btnCleanup.IsEnabled     = on && _doc != null;
             btnCreatePlans.IsEnabled = on && _doc != null;
