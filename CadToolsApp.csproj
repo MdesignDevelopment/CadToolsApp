@@ -14,4 +14,10 @@
     <PackageReference Include="netDxf" Version="3.0.1" />
     <PackageReference Include="ProjNet" Version="2.0.0" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Templates\table_layout_template.dxf">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
 </Project>

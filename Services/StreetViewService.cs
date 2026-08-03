@@ -14,63 +14,18 @@ namespace CadToolsApp.Services
         private const string IMG_SIZE = "640x640";
         private const int    IMG_FOV  = 120;
 
-        private static readonly string API_KEY = LoadApiKey();
-
-        private static string LoadApiKey()
-        {
-            string path = Path.Combine(AppContext.BaseDirectory, "config.txt");
-            if (!File.Exists(path))
-                throw new FileNotFoundException(
-                    $"config.txt not found next to the exe.\n" +
-                    $"Create it at: {path}\n" +
-                    $"Contents: STREETVIEW_API_KEY=your_key_here");
-
-            foreach (string line in File.ReadAllLines(path))
-            {
-                if (line.StartsWith("STREETVIEW_API_KEY=", StringComparison.OrdinalIgnoreCase))
-                    return line.Substring("STREETVIEW_API_KEY=".Length).Trim();
-            }
-
-            throw new InvalidOperationException(
-                "config.txt exists but is missing the STREETVIEW_API_KEY= line.");
-        }
-
-        private static readonly HttpClient _http = new HttpClient();
-
-        private static readonly string LAMBERT72_WKT = @"
-            PROJCS[""Belge 1972 / Belgian Lambert 72"",
-                GEOGCS[""Belge 1972"",
-                    DATUM[""Reseau_National_Belge_1972"",
-                        SPHEROID[""International 1924"",6378388,297],
-                        TOWGS84[-106.869,52.2978,-103.724,0.3366,-0.457,1.8422,-1.2747]],
-                    PRIMEM[""Greenwich"",0],
-                    UNIT[""degree"",0.0174532925199433]],
-                PROJECTION[""Lambert_Conformal_Conic_2SP""],
-                PARAMETER[""standard_parallel_1"",51.16666723333333],
-                PARAMETER[""standard_parallel_2"",49.8333339],
-                PARAMETER[""latitude_of_origin"",90],
-                PARAMETER[""central_meridian"",4.367486666666666],
-                PARAMETER[""false_easting"",150000.013],
-                PARAMETER[""false_northing"",5400088.438],
-                UNIT[""metre"",1]]";
+        private static string API_KEY => GoogleApi.ApiKey;
+        private static HttpClient _http => GoogleApi.Http;
 
         public event Action<string>? Progress;
 
         public void FetchImages(IList<SectionInfo> sections, string saveFolder)
         {
-            var csFactory = new CoordinateSystemFactory();
-            var ctFactory = new CoordinateTransformationFactory();
-            var transform = ctFactory.CreateFromCoordinateSystems(
-                csFactory.CreateFromWkt(LAMBERT72_WKT),
-                GeographicCoordinateSystem.WGS84);
-
             int saved = 0, nocover = 0, errors = 0;
 
             foreach (var sec in sections)
             {
-                double[] ll = transform.MathTransform.Transform(
-                    new[] { GetSectionX(sec), GetSectionY(sec) });
-                double lon = ll[0], lat = ll[1];
+                var (lat, lon) = BelgianCrs.ToWgs84(GetSectionX(sec), GetSectionY(sec));
                 double hdg = GetHeading(lat, lon);
                 double h1 = (hdg + 90)  % 360;
                 double h2 = (hdg + 270) % 360;

@@ -1,0 +1,18 @@
+# Fallback cable-type color/linetype mapping — only used when a drawing's own "Legende:" block
+# can't be found or a specific row can't be resolved to a nearby swatch (see Services/LegendReader.cs).
+# Copy this to cable_map.txt (next to the exe) and adjust to your own template's conventions if
+# the dynamic legend read isn't working for a particular drawing.
+#
+# Format: KEY=color,linetype
+#   KEY       — DB7, DB2, HDPE, COAX, or EXISTING (existing/"bestaande" infrastructure — excluded from totals)
+#   color     — the ACI color index netDxf resolves for that swatch (Entity.Color.Index)
+#   linetype  — the linetype name (Entity.Linetype.Name)
+#
+# Values below were confirmed against a real project drawing (Wyre/CCK Solutions, Beringen) —
+# they are a reasonable starting point, not a universal standard; different templates/companies
+# may use different colors.
+DB7=119,JIS_09_15
+DB2=145,JIS_09_15
+HDPE=23,JIS_09_15
+COAX=6,JIS_09_15
+EXISTING=250,DASHED

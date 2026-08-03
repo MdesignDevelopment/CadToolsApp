@@ -1,0 +1,143 @@
+<Window x:Class="CadToolsApp.Dialogs.CreatePlansDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Create Plans — review before writing"
+        Width="1060" Height="680"
+        MinWidth="860" MinHeight="520"
+        WindowStartupLocation="CenterScreen">
+
+    <Window.Resources>
+        <Style x:Key="FieldLabel" TargetType="TextBlock">
+            <Setter Property="Margin"            Value="0,0,8,0"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style TargetType="TextBox">
+            <Setter Property="Padding" Value="3,2"/>
+            <Setter Property="Margin"  Value="0,0,0,6"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TabControl Grid.Row="0">
+            <!-- ── Sheet info ────────────────────────────────────────────────── -->
+            <TabItem Header="Sheet">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="12">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="24"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel Grid.Column="0">
+                            <TextBlock Text="Title block" FontWeight="SemiBold" Margin="0,0,0,6"/>
+
+                            <TextBlock Text="Dossiernummer" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtDossier"/>
+
+                            <TextBlock Text="Street (printed under Vergunningsaanvraag)" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtStreet"/>
+
+                            <TextBlock Text="Municipality" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtCity"/>
+
+                            <TextBlock Text="Opgemaakt (date)" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtOpgemaakt"/>
+
+                            <TextBlock Text="Getekend door" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtGetekend"/>
+
+                            <TextBlock Text="Nagekeken" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtNagekeken"/>
+
+                            <TextBlock Text="Uitgevoerd door" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtUitgevoerd"/>
+                        </StackPanel>
+
+                        <StackPanel Grid.Column="2">
+                            <TextBlock Text="Works and quantities" FontWeight="SemiBold" Margin="0,0,0,6"/>
+
+                            <TextBlock Text="Begin der werken" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtBegin"/>
+
+                            <TextBlock Text="Einde der werken" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtEinde"/>
+
+                            <TextBlock Text="Geplaatste lengte (blank on the sample sheets)" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtGeplaatste"/>
+
+                            <TextBlock Text="Gesloopte lengte" Style="{StaticResource FieldLabel}"/>
+                            <TextBox x:Name="txtGesloopte"/>
+
+                            <TextBlock Text="Glasvezelput (Beton/CTB) — count, written as &quot;1st&quot;"
+                                       Style="{StaticResource FieldLabel}" TextWrapping="Wrap"/>
+                            <TextBox x:Name="txtPits"/>
+
+                            <Separator Margin="0,8"/>
+                            <TextBlock Text="Sheet setup" FontWeight="SemiBold" Margin="0,0,0,6"/>
+
+                            <TextBlock Text="Plot scale (raised automatically if the plan area does not fit)"
+                                       Style="{StaticResource FieldLabel}" TextWrapping="Wrap"/>
+                            <ComboBox x:Name="cmbScale" Margin="0,0,0,8"/>
+
+                            <TextBlock Text="Trench depth (cross-section detail)" Style="{StaticResource FieldLabel}"/>
+                            <ComboBox x:Name="cmbDepth" Margin="0,0,0,8"/>
+
+                            <CheckBox x:Name="chkMap" Margin="0,4,0,0"
+                                      Content="Fetch the Ligging locator map from Google Static Maps"/>
+                            <TextBlock Text="Uses the API key in config.txt and saves a PNG next to the DXF."
+                                       FontSize="10" Foreground="#666" TextWrapping="Wrap" Margin="20,2,0,0"/>
+                        </StackPanel>
+                    </Grid>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ── Cable review ──────────────────────────────────────────────── -->
+            <TabItem Header="Cables">
+                <Grid Margin="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Grid.Row="0" Margin="0,0,0,8" TextWrapping="Wrap"
+                               Text="Uncheck anything that shouldn't count, or fix a type/stripe/method the classifier got wrong."/>
+
+                    <DataGrid x:Name="grid" Grid.Row="1" AutoGenerateColumns="False"
+                              CanUserAddRows="False" CanUserDeleteRows="False"
+                              RowHeaderWidth="0" HeadersVisibility="Column"
+                              AlternatingRowBackground="#F7F7F7">
+                        <DataGrid.Columns>
+                            <DataGridCheckBoxColumn Header="Use" Binding="{Binding Include}" Width="40"/>
+                            <DataGridTextColumn Header="Handle" Binding="{Binding Handle}" Width="70" IsReadOnly="True"/>
+                            <DataGridTextColumn Header="Length (m)" Binding="{Binding Length, StringFormat={}{0:F1}}" Width="80" IsReadOnly="True"/>
+                            <DataGridComboBoxColumn x:Name="colType" Header="Type" SelectedItemBinding="{Binding Type}" Width="70"/>
+                            <DataGridComboBoxColumn x:Name="colStripe" Header="Stripe" SelectedItemBinding="{Binding Stripe}" Width="80"/>
+                            <DataGridComboBoxColumn x:Name="colMethod" Header="Method" SelectedItemBinding="{Binding Method}" Width="110"/>
+                            <DataGridTextColumn Header="Existing" Binding="{Binding ExistingFlag}" Width="55" IsReadOnly="True"/>
+                            <DataGridTextColumn Header="Boundary" Binding="{Binding BoundaryFlag}" Width="60" IsReadOnly="True"/>
+                            <DataGridTextColumn Header="Evidence" Binding="{Binding Evidence}" Width="*" IsReadOnly="True"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </Grid>
+            </TabItem>
+        </TabControl>
+
+        <StackPanel Grid.Row="1" Margin="0,8,0,8">
+            <TextBlock Text="Classifier log:" FontWeight="SemiBold" Margin="0,0,0,2"/>
+            <ListBox x:Name="lstLog" Height="70" FontSize="11"/>
+        </StackPanel>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+            <TextBlock x:Name="lblSummary" VerticalAlignment="Center" Margin="0,0,12,0" Foreground="#555"/>
+            <Button Content="Create Plans" Width="120" Margin="0,0,8,0" IsDefault="True" Click="Confirm_Click"/>
+            <Button Content="Cancel" Width="80" IsCancel="True" Click="Cancel_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

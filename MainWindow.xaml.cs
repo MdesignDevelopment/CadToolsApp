@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using CadToolsApp.Dialogs;
@@ -19,6 +20,10 @@ namespace CadToolsApp
 
         private static readonly string TemplateCfgPath =
             Path.Combine(AppContext.BaseDirectory, "xsec_template.txt");
+        private static readonly string CableMapCfgPath =
+            Path.Combine(AppContext.BaseDirectory, "cable_map.txt");
+        private static readonly string LayoutTemplatePath =
+            Path.Combine(AppContext.BaseDirectory, "Templates", "table_layout_template.dxf");
 
         public MainWindow()
         {
@@ -170,29 +175,62 @@ namespace CadToolsApp
             }
         }
 
-        // ── Fill Table ────────────────────────────────────────────────────────
-        private void FillTable_Click(object sender, RoutedEventArgs e)
+        // ── Create Plans ──────────────────────────────────────────────────────
+        // Sheet, quantity table, title block and locator map are one deliverable, so they are one
+        // action with one review step — the previous split let a sheet be saved with an unfilled
+        // table, or a table filled with no sheet to print it on.
+        private void CreatePlans_Click(object sender, RoutedEventArgs e)
         {
             if (_doc == null) return;
-            SetStatus("Scanning cables…");
 
+            if (!File.Exists(LayoutTemplatePath))
+            {
+                MessageBox.Show($"Layout template not found:\n{LayoutTemplatePath}",
+                    "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            SetStatus("Scanning cables…");
             try
             {
-                var (filled, log) = _dxf.FillTable(_doc);
-                Log(log);
-                if (filled > 0)
+                var classified = _dxf.ClassifyCables(_doc, _filePath, CableMapCfgPath);
+                foreach (var line in classified.Log) Log(line);
+
+                if (classified.Cables.Count == 0)
                 {
-                    SetStatus($"Fill table done — {filled} cell(s) written. Click Save.");
+                    SetStatus("Create Plans — no cables found; nothing to quantify.");
+                    return;
+                }
+
+                var info = SheetInfo.FromFileName(_filePath);
+                var dlg = new CreatePlansDialog(classified, info) { Owner = this };
+                if (dlg.ShowDialog() != true)
+                {
+                    SetStatus("Create Plans cancelled.");
+                    return;
+                }
+
+                var confirmed = dlg.ConfirmedRows.Select(r => new ClassifiedCable(
+                    r.Handle, r.Length, r.Type, r.Stripe, r.Method, r.RouteGroupId,
+                    r.Evidence, false, false)).ToList();
+
+                SetStatus("Creating plans…");
+                var (ok, log) = _dxf.CreatePlans(_doc, LayoutTemplatePath, confirmed, dlg.Info, _filePath);
+                foreach (var line in log) Log(line);
+
+                if (ok)
+                {
+                    SetStatus($"Plans created at {dlg.Info.ScaleLabel} — click Save to write the file.");
                     btnSave.IsEnabled = true;
                 }
                 else
                 {
-                    SetStatus("Fill table — nothing written.");
+                    SetStatus("Create Plans — nothing created; see the log.");
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Fill table error:\n{ex.Message}",
+                MessageBox.Show($"Create Plans error:\n{ex.Message}",
                     "Error", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
@@ -203,7 +241,7 @@ namespace CadToolsApp
             btnStreetView.IsEnabled  = on && _doc != null;
             btnCrossSection.IsEnabled = on && _doc != null;
             btnCleanup.IsEnabled     = on && _doc != null;
-            btnFillTable.IsEnabled   = on && _doc != null;
+            btnCreatePlans.IsEnabled = on && _doc != null;
             btnSave.IsEnabled        = on && _doc != null;
         }
 

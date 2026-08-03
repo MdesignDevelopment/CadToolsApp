@@ -70,11 +70,11 @@
                                Foreground="#666" Margin="0,3,0,0"/>
                 </StackPanel>
             </Button>
-            <Button Style="{StaticResource ToolBtn}" x:Name="btnFillTable"
-                    IsEnabled="False" Click="FillTable_Click">
+            <Button Style="{StaticResource ToolBtn}" x:Name="btnCreatePlans"
+                    IsEnabled="False" Click="CreatePlans_Click">
                 <StackPanel>
-                    <TextBlock Text="Fill Table" FontWeight="Bold"/>
-                    <TextBlock Text="Aggregate cable lengths" FontSize="10"
+                    <TextBlock Text="Create Plans" FontWeight="Bold"/>
+                    <TextBlock Text="Sheet, table &amp; title block" FontSize="10"
                                Foreground="#666" Margin="0,3,0,0"/>
                 </StackPanel>
             </Button>

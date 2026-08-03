@@ -7,6 +7,7 @@ using CadToolsApp.Models;
 using netDxf;
 using netDxf.Blocks;
 using netDxf.Entities;
+using netDxf.Objects;
 using netDxf.Tables;
 
 namespace CadToolsApp.Services
@@ -14,7 +15,6 @@ namespace CadToolsApp.Services
     public class DxfService
     {
         private const string SECTION_LAYER = "Cross sections";
-        private const string CABLE_LAYER   = "PDDucts BO";
 
         // ── Load / Save ────────────────────────────────────────────────────────
         public DxfDocument Load(string path)
@@ -119,55 +119,141 @@ namespace CadToolsApp.Services
             return turnedOff;
         }
 
-        // ── Fill summary table ─────────────────────────────────────────────────
-        public (int filled, string log) FillTable(DxfDocument doc)
+        // ── Project scope (derived from the sheet's clipped viewport) ──────────
+        // Model space can hold unrelated leftover/duplicate geometry clusters from other
+        // projects or revisions saved in the same file. The paperspace layout that plots
+        // this project uses a non-rectangularly-clipped Viewport whose visible area
+        // (ViewCenter +/- ViewHeight/2, aspect-corrected by Width/Height) is the one
+        // authoritative "what belongs to this sheet" boundary — read from the document
+        // itself, not a hardcoded layout name or coordinate range.
+        internal readonly record struct ScopeBox(double MinX, double MinY, double MaxX, double MaxY)
         {
-            var allTexts = new List<(Vector3 pos, string text)>();
-            foreach (var e in doc.Entities.All)
+            public bool Contains(double x, double y) => x >= MinX && x <= MaxX && y >= MinY && y <= MaxY;
+        }
+
+        internal static ScopeBox? FindProjectScope(DxfDocument doc)
+        {
+            Viewport? clipped = null;
+            foreach (var layout in doc.Layouts)
             {
-                switch (e)
-                {
-                    case Text   t: allTexts.Add((t.Position, t.Value)); break;
-                    case MText  m: allTexts.Add((m.Position, StripMText(m.Value))); break;
-                }
+                if (!layout.IsPaperSpace) continue;
+                clipped = layout.AssociatedBlock.Entities.OfType<Viewport>()
+                    .FirstOrDefault(vp => (vp.Status & ViewportStatusFlags.NonRectangularClipping) != 0);
+                if (clipped != null) break;
+            }
+            if (clipped == null) return null;
+
+            double aspect = clipped.Height == 0 ? 1.0 : clipped.Width / clipped.Height;
+            double halfH = clipped.ViewHeight / 2.0;
+            double halfW = halfH * aspect;
+
+            return new ScopeBox(
+                clipped.ViewCenter.X - halfW, clipped.ViewCenter.Y - halfH,
+                clipped.ViewCenter.X + halfW, clipped.ViewCenter.Y + halfH);
+        }
+
+        // Resolves BYLAYER color/linetype to the entity's actual layer defaults — comparing
+        // raw entity.Color/Linetype directly would treat every BYLAYER entity as identical
+        // regardless of which layer it's really drawn on.
+        internal static (short color, string linetype) ResolveColorLinetype(EntityObject e)
+        {
+            short color = e.Color.IsByLayer ? e.Layer.Color.Index : e.Color.Index;
+            string linetype = e.Linetype.IsByLayer ? e.Layer.Linetype.Name : e.Linetype.Name;
+            return (color, linetype);
+        }
+
+        // ── Fill summary table ─────────────────────────────────────────────────
+        // Step 1: classify every in-scope cable polyline (measurement + type/method evidence).
+        // The result is meant to be reviewed/edited by the user (see Dialogs/CreatePlansDialog)
+        // before WriteTable ever touches the document — every field here is a best-effort read
+        // of free-text callouts and drawing color conventions, not authoritative structured data.
+        public CableClassifier.ClassifyResult ClassifyCables(DxfDocument doc, string dxfFilePath, string? cableMapConfigPath = null) =>
+            CableClassifier.Classify(doc, dxfFilePath, cableMapConfigPath);
+
+        // Step 2: write the confirmed totals. Cable-type totals sum every entity individually
+        // (a real "2xDB7" run is two physical cables); method totals sum per RouteGroupId instead
+        // (one physical trench, however many parallel duct entities share it) — see
+        // CableClassifier's route-clustering comment for why the same geometry needs both rules.
+        // `table` is passed in by CreatePlans, which has already resolved the block for the sheet it
+        // just built — re-resolving here could pick a different revision and split the values
+        // across two blocks.
+        public (int filled, List<string> log) WriteTable(DxfDocument doc, List<ClassifiedCable> cables,
+            int pitCount = 0, Block? table = null)
+        {
+            var log = new List<string>();
+
+            var cableTotals = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            foreach (var c in cables)
+            {
+                string? key = ResolveCableRowKey(c.BaseType, c.Stripe, c.Evidence);
+                if (key == null) continue;
+                cableTotals[key] = cableTotals.GetValueOrDefault(key) + c.Length;
             }
 
-            var cables = new List<(double len, Vector3 mid, string label)>();
-            foreach (var e in doc.Entities.All)
-            {
-                if (e is Polyline2D lp &&
-                    lp.Layer.Name.Equals(CABLE_LAYER, StringComparison.OrdinalIgnoreCase))
-                {
-                    double  len = PolylineLength(lp);
-                    Vector3 mid = PolylineMid(lp);
-                    string label = NearestText(mid, allTexts);
-                    cables.Add((len, mid, label));
-                }
-            }
-
-            if (cables.Count == 0)
-                return (0, $"No cables found on layer '{CABLE_LAYER}'.");
-
-            var cableTotals  = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
             var methodTotals = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-            foreach (var (len, _, label) in cables)
+            foreach (var routeGroup in cables.Where(c => c.Method != null).GroupBy(c => c.RouteGroupId))
             {
-                string? ck = MatchCableKey(label);
-                string? mk = MatchMethodKey(label);
-                if (ck != null) { cableTotals.TryGetValue(ck,  out double cv); cableTotals[ck]  = cv + len; }
-                if (mk != null) { methodTotals.TryGetValue(mk, out double mv); methodTotals[mk] = mv + len; }
+                foreach (var methodGroup in routeGroup.GroupBy(c => c.Method))
+                {
+                    double len = methodGroup.Max(c => c.Length);
+                    methodTotals[methodGroup.Key!] = methodTotals.GetValueOrDefault(methodGroup.Key!) + len;
+                }
             }
-            methodTotals["TOTAAL"] = methodTotals.Values.Sum();
+            if (methodTotals.Count > 0)
+                methodTotals["TOTAAL"] = methodTotals.Values.Sum();
 
-            Insert? tableInsert = FindTableInsert(doc);
-            if (tableInsert == null)
-                return (0, "Table block not found — no block contains the expected cable labels.");
+            table ??= FindTableBlock(doc, log);
+            if (table == null)
+            {
+                log.Add("Table block not found — no block contains the expected header + row labels.");
+                return (0, log);
+            }
 
-            int filled = FillTableBlock(tableInsert.Block, cableTotals, methodTotals);
-            string log = $"Cables: {string.Join(", ", cableTotals.Select(kv => $"{kv.Key}={kv.Value:F0}m"))}\n" +
-                         $"Methods: {string.Join(", ", methodTotals.Select(kv => $"{kv.Key}={kv.Value:F0}m"))}\n" +
-                         $"{filled} cell(s) written.";
+            var onLayouts = doc.Layouts
+                .Where(l => l.AssociatedBlock.Entities.OfType<Insert>().Any(i => i.Block == table))
+                .Select(l => l.Name)
+                .ToList();
+            log.Add(onLayouts.Count > 0
+                ? $"Table block '{table.Name}' — writing here updates every sheet that references it: {string.Join(", ", onLayouts)}."
+                : $"Table block '{table.Name}' found, but no layout currently inserts it (writing to the definition anyway).");
+
+            // Every length cell reads "<n>m"; the pit row is the one exception — it counts units
+            // ("1st"), so values are formatted here and the writer stays format-agnostic.
+            var cableCells = cableTotals.ToDictionary(
+                kv => kv.Key, kv => $"{(int)Math.Round(kv.Value)}m", StringComparer.OrdinalIgnoreCase);
+            var methodCells = methodTotals.ToDictionary(
+                kv => kv.Key, kv => $"{(int)Math.Round(kv.Value)}m", StringComparer.OrdinalIgnoreCase);
+            if (pitCount > 0) cableCells[PitRowKey] = $"{pitCount}st";
+
+            int filled = WriteValuesIntoBlock(table, cableCells, methodCells);
+            log.Add($"Cables: {string.Join(", ", cableTotals.Select(kv => $"{kv.Key}={kv.Value:F0}m"))}");
+            log.Add($"Methods: {string.Join(", ", methodTotals.Select(kv => $"{kv.Key}={kv.Value:F0}m"))}");
+            if (pitCount > 0) log.Add($"Glasvezelput (Beton/CTB): {pitCount}st.");
+            log.Add($"{filled} cell(s) written.");
+
+            // "Geplaatste lengte" / "Gesloopte lengte" sit in the upper title-block band, not in
+            // this two-column table, so they are written by TitleBlockWriter from the confirmed
+            // sheet info instead of being derived here. The computed installed total is logged as
+            // a cross-check against whatever the drafter entered.
+            double installed = cables.Sum(c => c.Length);
+            log.Add($"Geplaatste lengte cross-check (sum of confirmed cable lengths): {installed:F0}m.");
+
             return (filled, log);
+        }
+
+        private static string? ResolveCableRowKey(string? baseType, string? stripe, string evidence)
+        {
+            switch (baseType)
+            {
+                case "DB7":  return stripe switch { "GREY" => "DB7-GREY", "ORANGE" => "DB7-ORANGE", _ => null };
+                case "DB2":  return stripe switch { "GREY" => "DB2-GREY", _ => null };
+                case "HDPE": return stripe switch { "GREY" => "HDPE50-GREY", "ORANGE" => "HDPE50-ORANGE", "GREEN" => "HDPE50-GREEN", _ => null };
+                case "COAX":
+                    if (Regex.IsMatch(evidence, @"14\s*mm", RegexOptions.IgnoreCase)) return "COAX14";
+                    if (Regex.IsMatch(evidence, @"20\s*mm", RegexOptions.IgnoreCase)) return "COAX20";
+                    return null;
+                default: return null;
+            }
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -413,7 +499,11 @@ namespace CadToolsApp.Services
             ("HDPE50 glasvezelbuis groen",         "HDPE50-GREEN"  ),
             ("Coax 14mm in groene buis %%C32mm",   "COAX14"        ),
             ("Coax 20mm in groene buis %%C40mm",   "COAX20"        ),
+            ("Glasvezelput (Beton/CTB)",           PitRowKey       ),
         };
+
+        // Shares the cable column but holds a unit count, not a length — see WriteTable.
+        internal const string PitRowKey = "GVP-BETON";
 
         private static readonly List<(string label, string key)> MethodRows = new()
         {
@@ -428,58 +518,66 @@ namespace CadToolsApp.Services
             ("Totale aanleg lengte",               "TOTAAL"    ),
         };
 
-        private static string? MatchCableKey(string text)
+        // Finds the table by content, not a template-specific block name — requires both the
+        // header labels and at least two row labels, since scanning every block definition (not
+        // just Model space) widens the surface for an accidental false-positive match.
+        //
+        // Real project files accumulate a dozen-plus near-identical title-block revisions (one per
+        // sheet the drafter ever set up), all of which match on content. Writing to whichever one
+        // the block table happens to list first would silently fill a sheet nobody prints, so a
+        // block that some paper-space layout actually inserts always wins over one that is only a
+        // leftover definition.
+        private static Block? FindTableBlock(DxfDocument doc, List<string>? log = null)
         {
-            if (Regex.IsMatch(text, @"DB7",      RegexOptions.IgnoreCase)) return "DB7-GREY";
-            if (Regex.IsMatch(text, @"DB2",      RegexOptions.IgnoreCase)) return "DB2-GREY";
-            if (Regex.IsMatch(text, @"HDPE",     RegexOptions.IgnoreCase)) return "HDPE50-GREY";
-            if (Regex.IsMatch(text, @"Coax.*14", RegexOptions.IgnoreCase)) return "COAX14";
-            if (Regex.IsMatch(text, @"Coax.*20", RegexOptions.IgnoreCase)) return "COAX20";
-            return null;
-        }
+            var matches = doc.Blocks.Where(IsTableBlock).ToList();
+            if (matches.Count == 0) return null;
 
-        private static string? MatchMethodKey(string text)
-        {
-            if (Regex.IsMatch(text, @"mantelboring.*110", RegexOptions.IgnoreCase)) return "MANTEL110";
-            if (Regex.IsMatch(text, @"mantelboring.*125", RegexOptions.IgnoreCase)) return "MANTEL125";
-            if (Regex.IsMatch(text, @"mantelboring.*200", RegexOptions.IgnoreCase)) return "MANTEL200";
-            if (Regex.IsMatch(text, @"mantelboring",      RegexOptions.IgnoreCase)) return "MANTEL125";
-            if (Regex.IsMatch(text, @"lijnboring",        RegexOptions.IgnoreCase)) return "LIJNBORING";
-            if (Regex.IsMatch(text, @"Handboring",        RegexOptions.IgnoreCase)) return "HANDBORING";
-            if (Regex.IsMatch(text, @"Droogtrekken",      RegexOptions.IgnoreCase)) return "DROOGTREK";
-            if (Regex.IsMatch(text, @"Doorsteek",         RegexOptions.IgnoreCase)) return "DOORSTEEK";
-            return "SLEUF";
-        }
+            var referenced = doc.Layouts
+                .Where(l => l.IsPaperSpace)
+                .SelectMany(l => l.AssociatedBlock.Entities.OfType<Insert>())
+                .Select(i => i.Block)
+                .Distinct()
+                .ToHashSet();
 
-        private static Insert? FindTableInsert(DxfDocument doc)
-        {
-            foreach (var ins in doc.Entities.Inserts)
+            var chosen = matches.FirstOrDefault(referenced.Contains) ?? matches[0];
+
+            if (matches.Count > 1 && log != null)
             {
-                int hits = 0;
-                foreach (var e in ins.Block.Entities)
-                {
-                    string raw = e switch
-                    {
-                        Text  t => t.Value,
-                        MText m => StripMText(m.Value),
-                        _       => "",
-                    };
-                    if (CableRows.Any(r =>
-                        raw.Equals(r.label, StringComparison.OrdinalIgnoreCase))) hits++;
-                }
-                if (hits >= 2) return ins;
+                int used = matches.Count(referenced.Contains);
+                log.Add($"{matches.Count} blocks match the table layout; chose '{chosen.Name}' " +
+                        $"({used} of them are placed on a sheet). Others: " +
+                        $"{string.Join(", ", matches.Where(b => b != chosen).Select(b => b.Name))}.");
             }
-            return null;
+            return chosen;
         }
 
-        private static int FillTableBlock(Block blk,
-            Dictionary<string, double> cableTotals,
-            Dictionary<string, double> methodTotals)
+        private static bool IsTableBlock(Block block)
         {
-            const double X_CABLE  = 924.80;
-            const double X_METHOD = 1056.18;
-            const double X_TOL    = 8.0;
-            const double Y_TOL    = 3.0;
+            int labelHits = 0;
+            bool hasHeader = false;
+            foreach (var e in block.Entities)
+            {
+                string raw = e switch
+                {
+                    Text  t => t.Value,
+                    MText m => StripMTextCodes(m.Value),
+                    _       => "",
+                };
+                if (CableRows.Concat(MethodRows).Any(r => raw.Equals(r.label, StringComparison.OrdinalIgnoreCase)))
+                    labelHits++;
+                if (raw.Equals("Te plaatsen net:", StringComparison.OrdinalIgnoreCase) ||
+                    raw.Equals("Uitvoering:", StringComparison.OrdinalIgnoreCase))
+                    hasHeader = true;
+            }
+            return labelHits >= 2 && hasHeader;
+        }
+
+        private static int WriteValuesIntoBlock(Block blk,
+            Dictionary<string, string> cableValues,
+            Dictionary<string, string> methodValues)
+        {
+            const double X_TOL = 8.0;
+            const double Y_TOL = 3.0;
 
             var cells = new List<(EntityObject ent, Vector3 pos, string text)>();
             foreach (var e in blk.Entities)
@@ -487,14 +585,32 @@ namespace CadToolsApp.Services
                 switch (e)
                 {
                     case Text  t: cells.Add((e, t.Position, t.Value)); break;
-                    case MText m: cells.Add((e, m.Position, StripMText(m.Value))); break;
+                    case MText m: cells.Add((e, m.Position, StripMTextCodes(m.Value))); break;
                 }
             }
 
+            // Value-column X is read from the document itself — the "m" header nearest to (and
+            // to the right of) each section's own label column — instead of a hardcoded literal
+            // that only matches one specific template revision.
+            double? ValueColumnX(string sectionLabel)
+            {
+                var label = cells.FirstOrDefault(c => c.text.Equals(sectionLabel, StringComparison.OrdinalIgnoreCase));
+                if (label.ent == null) return null;
+                return cells
+                    .Where(c => c.text.Trim().Equals("m", StringComparison.OrdinalIgnoreCase) && c.pos.X > label.pos.X)
+                    .OrderBy(c => c.pos.X)
+                    .Select(c => (double?)c.pos.X)
+                    .FirstOrDefault();
+            }
+
+            double? cableX = ValueColumnX("Te plaatsen net:");
+            double? methodX = ValueColumnX("Uitvoering:");
+
             int filled = 0;
 
-            void WriteCell(double targetX, string key, double metres)
+            void WriteCell(double? targetX, string key, string val)
             {
+                if (targetX == null) return;
                 string lbl = (CableRows.Concat(MethodRows))
                     .FirstOrDefault(r => r.key == key).label ?? key;
 
@@ -504,10 +620,9 @@ namespace CadToolsApp.Services
 
                 double rowY = labelCell.pos.Y;
                 var valCell = cells.FirstOrDefault(c =>
-                    Math.Abs(c.pos.X - targetX) < X_TOL &&
-                    Math.Abs(c.pos.Y - rowY)    < Y_TOL);
+                    Math.Abs(c.pos.X - targetX.Value) < X_TOL &&
+                    Math.Abs(c.pos.Y - rowY)           < Y_TOL);
 
-                string val = $"{(int)Math.Round(metres)}m";
                 if (valCell.ent != null)
                 {
                     if (valCell.ent is Text  tv) tv.Value = val;
@@ -515,63 +630,409 @@ namespace CadToolsApp.Services
                 }
                 else
                 {
-                    blk.Entities.Add(new Text(val, new Vector3(targetX, rowY, 0), 2.5));
+                    blk.Entities.Add(new Text(val, new Vector3(targetX.Value, rowY, 0), 2.5));
                 }
                 filled++;
             }
 
             foreach (var (_, key) in CableRows)
-                if (cableTotals.TryGetValue(key, out double m)) WriteCell(X_CABLE, key, m);
+                if (cableValues.TryGetValue(key, out string? v)) WriteCell(cableX, key, v);
             foreach (var (_, key) in MethodRows)
-                if (methodTotals.TryGetValue(key, out double m)) WriteCell(X_METHOD, key, m);
+                if (methodValues.TryGetValue(key, out string? v)) WriteCell(methodX, key, v);
 
             return filled;
         }
 
+        // ── Create layout (fresh sheet from the title-block template) ──────────
+        // The template is authored full size on an A0 sheet, with "SCHAAL 1/500" and a scale bar
+        // drawn to match that. Reproducing a real permit sheet therefore means inserting the block
+        // 1:1 on A0 paper and giving the viewport a *true* 1/500 view height. Scaling the block
+        // down onto A4 (as this did previously) reduced the drawing four-fold while leaving the
+        // printed scale note and the scale bar untouched — every sheet claimed a scale it wasn't.
+        private const string LayoutBoxLayer  = "LAYOUT_BOX";
+        private const double ViewportMargin  = 6.0;   // mm inset from the template's divider line
+        private const double ViewZoomPadding = 1.05;  // headroom so the marked area isn't flush against the frame
+
+        // Plot scales a permit sheet is allowed to use, smallest first. 1/500 is the house default;
+        // anything larger is only reached because the marked plan area cannot fit at 1/500.
+        private static readonly int[] StandardScales = { 100, 200, 250, 500, 1000, 2000, 2500, 5000 };
+
+        // Model units are metres (Belgian Lambert 72), paper units are millimetres.
+        private static double MetresPerPaperMm(int denominator) => denominator / 1000.0;
+
+        public (bool ok, List<string> log, Block? table) CreateLayout(
+            DxfDocument doc, string templatePath, SheetInfo info)
+        {
+            var log = new List<string>();
+
+            ScopeBox? userBox = FindLayoutBoxRectangle(doc);
+            if (userBox == null)
+            {
+                log.Add($"No closed rectangle found on layer '{LayoutBoxLayer}' — draw one there to mark the plan area, then try again.");
+                return (false, log, null);
+            }
+            log.Add($"Plan area (from '{LayoutBoxLayer}'): X[{userBox.Value.MinX:F1}, {userBox.Value.MaxX:F1}]  Y[{userBox.Value.MinY:F1}, {userBox.Value.MaxY:F1}]");
+
+            Block tableBlock;
+            try
+            {
+                tableBlock = ImportOrReuseTableBlock(doc, templatePath, log);
+            }
+            catch (Exception ex)
+            {
+                log.Add($"Template error: {ex.Message}");
+                return (false, log, null);
+            }
+
+            var divider = FindVerticalDivider(tableBlock);
+            if (divider == null)
+            {
+                log.Add("Could not find the divider line between the drawing area and the table column in the template block.");
+                return (false, log, null);
+            }
+
+            // The sheet is the template's own border, used at 1:1 — so block units are paper mm.
+            var sheet = BlockGeometryBBox(tableBlock);
+            double sheetW = sheet.MaxX - sheet.MinX;
+            double sheetH = sheet.MaxY - sheet.MinY;
+
+            double pMinX = sheet.MinX + ViewportMargin;
+            double pMaxX = divider.Value.x - ViewportMargin;
+            double pMinY = divider.Value.yMin + ViewportMargin;
+            double pMaxY = divider.Value.yMax - ViewportMargin;
+            double vpWidth = pMaxX - pMinX, vpHeight = pMaxY - pMinY;
+
+            if (vpWidth <= 1 || vpHeight <= 1)
+            {
+                log.Add($"Template drawing area came out as {vpWidth:F1}x{vpHeight:F1}mm — the sheet border or the column divider was not recognised.");
+                return (false, log, null);
+            }
+
+            double rectW = userBox.Value.MaxX - userBox.Value.MinX;
+            double rectH = userBox.Value.MaxY - userBox.Value.MinY;
+            int denominator = ChooseScale(info.ScaleDenominator, rectW, rectH, vpWidth, vpHeight, log);
+            info.ScaleDenominator = denominator;
+
+            string layoutName = NextLayoutName(doc);
+            var layout = new Layout(layoutName)
+            {
+                MinLimit = new Vector2(sheet.MinX, sheet.MinY),
+                MaxLimit = new Vector2(sheet.MaxX, sheet.MaxY),
+            };
+            var (paperName, paperSize) = MatchIsoPaper(sheetW, sheetH);
+            layout.PlotSettings.PaperSizeName = paperName;
+            layout.PlotSettings.PaperSize     = paperSize;
+            layout.PlotSettings.PaperUnits    = PlotPaperUnits.Milimeters;
+            layout.PlotSettings.PrintScaleNumerator   = 1.0;
+            layout.PlotSettings.PrintScaleDenominator = 1.0;   // the sheet itself plots 1:1
+            layout.PlotSettings.ScaleToFit = false;
+            doc.Layouts.Add(layout);
+
+            layout.AssociatedBlock.Entities.Add(new Insert(tableBlock, new Vector3(0, 0, 0)));
+
+            double rectCx = (userBox.Value.MinX + userBox.Value.MaxX) / 2.0;
+            double rectCy = (userBox.Value.MinY + userBox.Value.MaxY) / 2.0;
+
+            // At a fixed plot scale the view height follows from the viewport's paper height —
+            // it is no longer fitted to the rectangle, which is what made the old scale arbitrary.
+            double viewHeight = vpHeight * MetresPerPaperMm(denominator);
+
+            var viewport = new Viewport(new Vector2((pMinX + pMaxX) / 2.0, (pMinY + pMaxY) / 2.0), vpWidth, vpHeight)
+            {
+                ViewCenter = new Vector2(rectCx, rectCy),
+                ViewHeight = viewHeight,
+            };
+            viewport.Status &= ~ViewportStatusFlags.GridMode; // netDxf defaults new viewports to grid-on
+            // A loose (not-yet-owned) Layer instance is required here — netDxf's FrozenLayers
+            // collection rejects one already registered in doc.Layers and binds this one by
+            // name to the real table entry once the viewport is added to the document.
+            viewport.FrozenLayers.Add(new Layer(LayoutBoxLayer)); // the marker rectangle is drafting-only, not part of the sheet
+            layout.AssociatedBlock.Entities.Add(viewport);
+
+            // Per-viewport freezing did not survive a save/reload round-trip, so the marker also
+            // gets its layer flagged non-plotting — that is a layer-table property and does
+            // persist, and it is what actually keeps the rectangle off the printed sheet.
+            if (doc.Layers.Contains(LayoutBoxLayer))
+            {
+                doc.Layers[LayoutBoxLayer].Plot = false;
+                log.Add($"Layer '{LayoutBoxLayer}' set to non-plotting — the marker rectangle stays visible on screen but off the print.");
+            }
+
+            log.Add($"Layout '{layoutName}' created — {paperName.Replace("psk:ISO", "")} landscape " +
+                    $"({sheetW:F0}x{sheetH:F0}mm), title block inserted at 1:1.");
+            log.Add($"Plot scale 1/{denominator}: viewport {vpWidth:F0}x{vpHeight:F0}mm covers " +
+                    $"{vpWidth * MetresPerPaperMm(denominator):F0}x{viewHeight:F0}m of ground, " +
+                    $"centred on ({rectCx:F1}, {rectCy:F1}).");
+
+            return (true, log, tableBlock);
+        }
+
+        // Keeps the requested scale when the marked area fits, otherwise steps up to the first
+        // standard scale that does — never an in-between value, because the sheet's scale bar and
+        // "SCHAAL 1/x" note have to state a scale a reader can measure against.
+        private static int ChooseScale(int requested, double rectW, double rectH,
+            double vpWidth, double vpHeight, List<string> log)
+        {
+            double needW = rectW * ViewZoomPadding, needH = rectH * ViewZoomPadding;
+
+            bool Fits(int d) =>
+                vpWidth * MetresPerPaperMm(d) >= needW && vpHeight * MetresPerPaperMm(d) >= needH;
+
+            if (Fits(requested)) return requested;
+
+            foreach (int d in StandardScales.Where(d => d > requested))
+            {
+                if (!Fits(d)) continue;
+                log.Add($"Plan area is {rectW:F0}x{rectH:F0}m — too large for 1/{requested}; " +
+                        $"stepped up to the next standard scale that fits, 1/{d}.");
+                return d;
+            }
+
+            int largest = StandardScales[^1];
+            log.Add($"WARNING: plan area is {rectW:F0}x{rectH:F0}m and does not fit even at 1/{largest} — " +
+                    $"using 1/{largest}; the sheet will be clipped. Split the project over several sheets.");
+            return largest;
+        }
+
+        // ISO paper the template border corresponds to, so the layout opens with the right sheet
+        // selected instead of whatever the receiving CAD session defaults to.
+        private static (string name, Vector2 size) MatchIsoPaper(double width, double height)
+        {
+            double shortSide = Math.Min(width, height), longSide = Math.Max(width, height);
+            (string name, double w, double h)[] iso =
+            {
+                ("psk:ISOA4", 210, 297), ("psk:ISOA3", 297, 420), ("psk:ISOA2", 420, 594),
+                ("psk:ISOA1", 594, 841), ("psk:ISOA0", 841, 1189),
+            };
+
+            foreach (var (name, w, h) in iso)
+                if (Math.Abs(shortSide - w) <= 3 && Math.Abs(longSide - h) <= 3)
+                    return (name, new Vector2(w, h));
+
+            return ("psk:UserDefined", new Vector2(shortSide, longSide));
+        }
+
+        // ── Create Plans ───────────────────────────────────────────────────────
+        // One pass over everything a finished sheet needs, in the only order that works: the sheet
+        // has to exist (and pull in the title block) before there is anything to write values into.
+        // Each step logs and reports its own outcome — a failed locator map must not lose the table
+        // and title-block work that already succeeded.
+        public (bool ok, List<string> log) CreatePlans(
+            DxfDocument doc, string templatePath, List<ClassifiedCable> confirmed,
+            SheetInfo info, string dxfFilePath)
+        {
+            var log = new List<string>();
+
+            var (layoutOk, layoutLog, table) = CreateLayout(doc, templatePath, info);
+            log.AddRange(layoutLog);
+            if (!layoutOk || table == null) return (false, log);
+
+            var (filled, tableLog) = WriteTable(doc, confirmed, info.PitCount, table);
+            log.AddRange(tableLog);
+
+            var (fields, titleLog) = TitleBlockWriter.Write(doc, table, info);
+            log.AddRange(titleLog);
+
+            if (info.FetchLiggingMap)
+            {
+                var (_, mapLog) = LiggingMapService.AddLiggingMap(
+                    doc, table, RouteGeometry(doc, confirmed),
+                    Path.GetDirectoryName(dxfFilePath) ?? AppContext.BaseDirectory,
+                    Path.GetFileNameWithoutExtension(dxfFilePath));
+                log.AddRange(mapLog);
+            }
+            else
+            {
+                log.Add("Ligging map: skipped at your request — paste the locator image manually.");
+            }
+
+            log.Add($"Create Plans finished — {filled} table cell(s) and {fields} title-block field(s) written.");
+            return (true, log);
+        }
+
+        // One vertex list per physical route, for tracing on the locator map. Parallel ducts in the
+        // same trench would draw the same red line twice, so only the longest entity per route
+        // group is traced.
+        private static List<IReadOnlyList<Vector2>> RouteGeometry(DxfDocument doc, List<ClassifiedCable> cables)
+        {
+            var routes = new List<IReadOnlyList<Vector2>>();
+
+            foreach (var group in cables.GroupBy(c => c.RouteGroupId))
+            {
+                Polyline2D? longest = null;
+                double bestLength = 0;
+                foreach (var cable in group)
+                {
+                    if (doc.GetObjectByHandle(cable.Handle) is not Polyline2D poly) continue;
+                    if (longest != null && cable.Length <= bestLength) continue;
+                    longest = poly;
+                    bestLength = cable.Length;
+                }
+                if (longest != null)
+                    routes.Add(longest.Vertexes.Select(v => v.Position).ToList());
+            }
+
+            return routes;
+        }
+
+        private static string NextLayoutName(DxfDocument doc)
+        {
+            int n = 1;
+            while (doc.Layouts.Contains($"Overzicht {n}")) n++;
+            return $"Overzicht {n}";
+        }
+
+        private static ScopeBox? FindLayoutBoxRectangle(DxfDocument doc)
+        {
+            foreach (var e in doc.Entities.All)
+            {
+                if (e is not Polyline2D poly) continue;
+                if (poly.Layer == null || !poly.Layer.Name.Equals(LayoutBoxLayer, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!poly.IsClosed || poly.Vertexes.Count < 4) continue;
+
+                double minX = poly.Vertexes.Min(v => v.Position.X);
+                double maxX = poly.Vertexes.Max(v => v.Position.X);
+                double minY = poly.Vertexes.Min(v => v.Position.Y);
+                double maxY = poly.Vertexes.Max(v => v.Position.Y);
+                return new ScopeBox(minX, minY, maxX, maxY);
+            }
+            return null;
+        }
+
+        // Reuses a table block already in the document (e.g. from a previous Create Layout
+        // run) instead of importing a duplicate; only pulls from the template when this
+        // document doesn't have one yet.
+        private static Block ImportOrReuseTableBlock(DxfDocument doc, string templatePath, List<string> log)
+        {
+            var existing = FindTableBlock(doc, log);
+            if (existing != null)
+            {
+                log.Add($"Reusing existing table block '{existing.Name}' already in this document.");
+                return existing;
+            }
+
+            var src = DxfDocument.Load(templatePath);
+            var srcBlock = FindTableBlock(src);
+            if (srcBlock == null)
+                throw new InvalidOperationException(
+                    "Template file does not contain a recognizable table block (expected header + row labels).");
+
+            var visited = new Dictionary<string, Block>(StringComparer.OrdinalIgnoreCase);
+            var clone = CloneBlockIntoDocument(doc, srcBlock, visited);
+            log.Add($"Imported table block '{clone.Name}' from template '{Path.GetFileName(templatePath)}'.");
+            return clone;
+        }
+
+        // Deep-copies a block (and, recursively, any block referenced by a nested Insert)
+        // into the target document — netDxf's Clone() copies entities but nested Insert
+        // references still point at the source document's blocks, so those get rebuilt
+        // against the newly cloned copies here.
+        private static Block CloneBlockIntoDocument(DxfDocument doc, Block src, Dictionary<string, Block> visited)
+        {
+            if (visited.TryGetValue(src.Name, out var already)) return already;
+            if (doc.Blocks.Contains(src.Name))
+            {
+                var existing = doc.Blocks[src.Name];
+                visited[src.Name] = existing;
+                return existing;
+            }
+
+            var clone = (Block)src.Clone();
+            clone.Name = src.Name;
+            visited[src.Name] = clone;
+            doc.Blocks.Add(clone);
+
+            foreach (var ins in clone.Entities.OfType<Insert>().ToList())
+            {
+                Block nestedClone = CloneBlockIntoDocument(doc, ins.Block, visited);
+                if (ReferenceEquals(nestedClone, ins.Block)) continue;
+
+                var replacement = new Insert(nestedClone, ins.Position)
+                {
+                    Scale     = ins.Scale,
+                    Rotation  = ins.Rotation,
+                    Layer     = ins.Layer,
+                    Color     = ins.Color,
+                    Linetype  = ins.Linetype,
+                    Lineweight = ins.Lineweight,
+                };
+                clone.Entities.Remove(ins);
+                clone.Entities.Add(replacement);
+            }
+
+            return clone;
+        }
+
+        private static ScopeBox BlockGeometryBBox(Block blk)
+        {
+            double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
+            void Consider(double x, double y)
+            {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+
+            foreach (var e in blk.Entities)
+            {
+                switch (e)
+                {
+                    case Line l: Consider(l.StartPoint.X, l.StartPoint.Y); Consider(l.EndPoint.X, l.EndPoint.Y); break;
+                    case Polyline2D p: foreach (var v in p.Vertexes) Consider(v.Position.X, v.Position.Y); break;
+                }
+            }
+
+            return new ScopeBox(minX, minY, maxX, maxY);
+        }
+
+        // Finds the divider between the drawing-area box and the title-block column: the
+        // longest vertical line in the block spans the box's full height by construction,
+        // so its X is the divider and its Y-span is the box's vertical extent — read from
+        // the template's own geometry instead of a hardcoded coordinate.
+        private static (double x, double yMin, double yMax)? FindVerticalDivider(Block blk)
+        {
+            Line? best = null;
+            double bestLen = 0;
+            foreach (var l in blk.Entities.OfType<Line>())
+            {
+                if (Math.Abs(l.StartPoint.X - l.EndPoint.X) > 0.01) continue;
+                double len = Math.Abs(l.EndPoint.Y - l.StartPoint.Y);
+                if (len > bestLen) { bestLen = len; best = l; }
+            }
+            if (best == null) return null;
+            return (best.StartPoint.X, Math.Min(best.StartPoint.Y, best.EndPoint.Y), Math.Max(best.StartPoint.Y, best.EndPoint.Y));
+        }
+
         // ── Polyline helpers ──────────────────────────────────────────────────
-        private static double PolylineLength(Polyline2D poly)
+        // Segment length, following the vertex's bulge (tan(included-angle/4)) when
+        // nonzero — a straight chord-length sum silently undercounts any curved run.
+        private static double SegmentLength(Vector2 a, Vector2 b, double bulge)
+        {
+            double dx = b.X - a.X, dy = b.Y - a.Y;
+            double chord = Math.Sqrt(dx * dx + dy * dy);
+            if (bulge == 0.0 || chord == 0.0) return chord;
+
+            double theta = 4.0 * Math.Atan(bulge);
+            double radius = chord / (2.0 * Math.Sin(theta / 2.0));
+            return Math.Abs(radius * theta);
+        }
+
+        internal static double PolylineLength(Polyline2D poly)
         {
             double len = 0;
             var verts = poly.Vertexes;
             for (int i = 0; i < verts.Count - 1; i++)
-            {
-                double dx = verts[i + 1].Position.X - verts[i].Position.X;
-                double dy = verts[i + 1].Position.Y - verts[i].Position.Y;
-                len += Math.Sqrt(dx * dx + dy * dy);
-            }
+                len += SegmentLength(verts[i].Position, verts[i + 1].Position, verts[i].Bulge);
+
             if (poly.IsClosed && verts.Count > 1)
-            {
-                double dx = verts[0].Position.X - verts[verts.Count - 1].Position.X;
-                double dy = verts[0].Position.Y - verts[verts.Count - 1].Position.Y;
-                len += Math.Sqrt(dx * dx + dy * dy);
-            }
+                len += SegmentLength(verts[^1].Position, verts[0].Position, verts[^1].Bulge);
+
             return len;
         }
 
-        private static Vector3 PolylineMid(Polyline2D poly)
-        {
-            if (poly.Vertexes.Count == 0) return Vector3.Zero;
-            double x = poly.Vertexes.Average(v => v.Position.X);
-            double y = poly.Vertexes.Average(v => v.Position.Y);
-            return new Vector3(x, y, 0);
-        }
 
-        private static string NearestText(Vector3 origin,
-            List<(Vector3 pos, string text)> texts)
-        {
-            if (texts.Count == 0) return string.Empty;
-            double best = double.MaxValue;
-            string res  = string.Empty;
-            foreach (var (pos, text) in texts)
-            {
-                double dx = origin.X - pos.X, dy = origin.Y - pos.Y;
-                double d  = Math.Sqrt(dx * dx + dy * dy);
-                if (d < best) { best = d; res = text; }
-            }
-            return res;
-        }
-
-        private static string StripMText(string raw)
+        internal static string StripMTextCodes(string raw)
         {
             string s = Regex.Replace(raw, @"\\[A-Za-z][^;]*;", "");
             s = s.Replace(@"\P", "\n").Replace(@"\p", "\n")
