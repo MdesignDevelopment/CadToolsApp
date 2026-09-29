@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -10,108 +9,75 @@ using System.Windows.Controls;
 using System.Windows.Media.Imaging;
 using CadToolsApp.Models;
 using CadToolsApp.Services;
-using Microsoft.Win32;
 
 namespace CadToolsApp.Dialogs
 {
     public partial class CrossSectionDialog : Window
     {
-        private readonly ObservableCollection<LayoutZone> _zones = new();
-        private bool _sync;
-        private bool _initialized;
-        private bool _webViewReady;
-        private SectionInfo? _pendingSection;
-        private readonly string _folder;
+        private readonly List<string> _presetNames;
+        private readonly string       _folder;
+        private bool                  _webViewReady;
+        private SectionInfo?          _pendingSection;
 
-        public string           SectionId        { get; private set; } = "";
-        public SectionInfo?     SelectedSection  { get; private set; }
-        public string           SelectedImagePath => SelectedSection?.ImagePath ?? "";
-        public double           InsertX          { get; private set; }
-        public double           InsertY          { get; private set; }
-        public List<LayoutZone> Zones            => _zones.ToList();
+        public string        SectionId          { get; private set; } = "";
+        public string        SelectedPresetName  { get; private set; } = "";
+        public SectionInfo?  SelectedSection    { get; private set; }
+        public string        SelectedImagePath  => SelectedSection?.ImagePath ?? "";
 
-        private static readonly ZonePreset[] FullPresets =
-        {
-            new("Voetpad - Rijbaan - Rijbaan - Voetpad",
-                (ZoneType.Voetpad, 1.5), (ZoneType.RijbaanFront, 3.0),
-                (ZoneType.RijbaanBack, 3.0), (ZoneType.Voetpad, 1.5)),
+        public record QueueEntry(string SectionId, string PresetName, string ImagePath, string Address, double ModelX, double ModelY);
+        public List<QueueEntry> Queue { get; } = new();
 
-            new("Fietspad - Rijbaan - Rijbaan - Fietspad",
-                (ZoneType.Fietspad, 2.0), (ZoneType.RijbaanFront, 3.0),
-                (ZoneType.RijbaanBack, 3.0), (ZoneType.Fietspad, 2.0)),
-
-            new("Berm - Fietspad - Voetpad - Rijbaan - Rijbaan - Voetpad - Fietspad - Berm",
-                (ZoneType.Berm, 1.0), (ZoneType.Fietspad, 2.0), (ZoneType.Voetpad, 1.5),
-                (ZoneType.RijbaanFront, 2.5), (ZoneType.RijbaanBack, 2.5),
-                (ZoneType.Voetpad, 1.5), (ZoneType.Fietspad, 2.0), (ZoneType.Berm, 1.0)),
-
-            new("Berm Trees - Fietspad - Voetpad - Rijbaan - Rijbaan - Voetpad - Fietspad - Berm Trees",
-                (ZoneType.BermTrees, 1.5), (ZoneType.Fietspad, 2.0), (ZoneType.Voetpad, 1.5),
-                (ZoneType.RijbaanFront, 2.5), (ZoneType.RijbaanBack, 2.5),
-                (ZoneType.Voetpad, 1.5), (ZoneType.Fietspad, 2.0), (ZoneType.BermTrees, 1.5)),
-
-            new("Voetpad - Rijbaan - Rijbaan - Voetpad - Fietspad",
-                (ZoneType.Voetpad, 1.5), (ZoneType.RijbaanFront, 2.5),
-                (ZoneType.RijbaanBack, 2.5), (ZoneType.Voetpad, 1.5), (ZoneType.Fietspad, 2.0)),
-        };
-
-        private static readonly ZonePreset[] SidePresets =
-        {
-            new("Voetpad",                 (ZoneType.Voetpad, 1.5)),
-            new("Fietspad",                (ZoneType.Fietspad, 2.0)),
-            new("Voetpad - Fietspad",      (ZoneType.Voetpad, 1.5), (ZoneType.Fietspad, 2.0)),
-            new("Berm - Voetpad - Fietspad",
-                (ZoneType.Berm, 1.0), (ZoneType.Voetpad, 1.5), (ZoneType.Fietspad, 2.0)),
-            new("Berm Trees - Voetpad - Fietspad",
-                (ZoneType.BermTrees, 1.5), (ZoneType.Voetpad, 1.5), (ZoneType.Fietspad, 2.0)),
-        };
-
-        private static readonly ZoneType[] FullTypes =
-        {
-            ZoneType.Berm, ZoneType.BermTrees, ZoneType.Fietspad,
-            ZoneType.Voetpad, ZoneType.RijbaanFront, ZoneType.RijbaanBack, ZoneType.Parking,
-        };
-
-        private static readonly ZoneType[] SideTypes =
-        {
-            ZoneType.Berm, ZoneType.BermTrees, ZoneType.Fietspad, ZoneType.Voetpad,
-        };
-
-        public CrossSectionDialog(IList<SectionInfo> sections, string folder)
+        public CrossSectionDialog(IList<SectionInfo> sections, string folder, List<string> presetNames)
         {
             InitializeComponent();
             _folder      = folder;
-            _initialized = true;
+            _presetNames = presetNames;
 
-            lstZones.ItemsSource    = _zones;
             lstSections.ItemsSource = sections;
+            cmbPreset.ItemsSource   = presetNames;
 
-            RebuildButtons(FullTypes);
-            RebuildTypeCombo(FullTypes);
-            ApplyPresets(FullPresets);
+            if (presetNames.Count > 0)
+                cmbPreset.SelectedIndex = 0;
 
-            if (sections.Count > 0) lstSections.SelectedIndex = 0;
+            if (sections.Count > 0)
+                lstSections.SelectedIndex = 0;
 
-            Loaded += async (s, e) => await InitWebViewAsync();
+            Loaded += async (s, e) =>
+            {
+                await InitWebViewAsync();
+            };
         }
 
-        // ── WebView2 initialisation ───────────────────────────────────────────
+        // ── Street name lookup ────────────────────────────────────────────────
+
+        private Task FetchStreetNamesAsync(IList<SectionInfo> sections)
+        {
+            // Geocoding API not enabled — section IDs are shown without street names.
+            // The DXF address is extracted from the file name in MainWindow.
+            return Task.CompletedTask;
+        }
+
+        // ── WebView2 ──────────────────────────────────────────────────────────
 
         private async Task InitWebViewAsync()
         {
             try
             {
-                await webView.EnsureCoreWebView2Async(null);
+                string userDataFolder = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "CadToolsApp", "WebView2");
+                var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment
+                    .CreateAsync(null, userDataFolder);
+                await webView.EnsureCoreWebView2Async(env);
                 webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
-                webView.CoreWebView2.Settings.AreDevToolsEnabled = false;
-                _webViewReady = true;
+                webView.CoreWebView2.Settings.AreDevToolsEnabled            = false;
+                _webViewReady    = true;
                 btnCapture.IsEnabled = true;
                 if (_pendingSection != null) LoadPanorama(_pendingSection);
             }
-            catch
+            catch (Exception ex)
             {
-                lblCaptureStatus.Text =
-                    "Street View viewer unavailable (WebView2 runtime not found).";
+                lblCaptureStatus.Text = $"Street View unavailable: {ex.Message}";
             }
         }
 
@@ -131,76 +97,15 @@ namespace CadToolsApp.Dialogs
             return $@"<!DOCTYPE html><html><head>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
-html,body{{width:100%;height:100%;overflow:hidden;position:relative}}
+html,body{{width:100%;height:100%;overflow:hidden}}
 #sv{{width:100%;height:100%}}
-#ov{{position:absolute;top:0;left:0;width:100%;height:100%;z-index:20;pointer-events:none}}
-.mask{{position:absolute;background:rgba(0,0,0,0.55);pointer-events:none}}
-#fr{{position:absolute;border:2px solid #fff;cursor:move;pointer-events:all;
-     z-index:21;user-select:none}}
-#rsz{{position:absolute;bottom:2px;right:2px;width:16px;height:16px;
-      cursor:nwse-resize;background:#fff;opacity:0.85;border-radius:2px}}
-#lbl{{position:absolute;bottom:4px;left:4px;color:#fff;font:11px sans-serif;
-      background:rgba(0,0,0,0.5);padding:2px 5px;border-radius:2px;pointer-events:none}}
 </style></head><body>
 <div id='sv'></div>
-<div id='ov'>
-  <div id='mT' class='mask' style='top:0;left:0;width:100%'></div>
-  <div id='mB' class='mask' style='left:0;width:100%;bottom:0'></div>
-  <div id='mL' class='mask' style='left:0'></div>
-  <div id='mR' class='mask' style='right:0'></div>
-  <div id='fr'>
-    <div id='rsz'></div>
-    <div id='lbl'>199 x 83</div>
-  </div>
-</div>
 <script>
-var AW=199,AH=83,BASE_FOV=120;
-var fw,fh,fx,fy;
-
-function initFrame(){{
-  fw=window.innerWidth*0.78;
-  fw=Math.min(fw,window.innerHeight*AW/AH);
-  fh=fw*AH/AW;
-  fx=(window.innerWidth-fw)/2;
-  fy=(window.innerHeight-fh)/2;
-  upd();
-}}
-
-function upd(){{
-  fw=Math.max(40,Math.min(window.innerWidth,Math.min(fw,window.innerHeight*AW/AH)));
-  fh=fw*AH/AW;
-  fx=Math.max(0,Math.min(window.innerWidth-fw,fx));
-  fy=Math.max(0,Math.min(window.innerHeight-fh,fy));
-  var fr=document.getElementById('fr');
-  fr.style.left=fx+'px';fr.style.top=fy+'px';fr.style.width=fw+'px';fr.style.height=fh+'px';
-  var mT=document.getElementById('mT'),mB=document.getElementById('mB');
-  var mL=document.getElementById('mL'),mR=document.getElementById('mR');
-  mT.style.height=fy+'px';
-  mB.style.top=(fy+fh)+'px';mB.style.height=(window.innerHeight-fy-fh)+'px';
-  mL.style.top=fy+'px';mL.style.height=fh+'px';mL.style.width=fx+'px';
-  var rx=fx+fw;
-  mR.style.top=fy+'px';mR.style.height=fh+'px';mR.style.left=rx+'px';
-  mR.style.width=(window.innerWidth-rx)+'px';
-}}
-
-window.addEventListener('resize',function(){{fw=Math.min(fw,window.innerWidth);upd();}});
-
-var drag=false,resz=false,sx,sy,ox,oy,ow;
-document.getElementById('fr').addEventListener('mousedown',function(e){{
-  if(e.target.id==='rsz'){{resz=true;sx=e.clientX;ow=fw;}}
-  else{{drag=true;sx=e.clientX;sy=e.clientY;ox=fx;oy=fy;}}
-  e.stopPropagation();e.preventDefault();
-}});
-document.addEventListener('mousemove',function(e){{
-  if(drag){{fx=ox+(e.clientX-sx);fy=oy+(e.clientY-sy);upd();}}
-  else if(resz){{fw=Math.max(60,ow+(e.clientX-sx));upd();}}
-}});
-document.addEventListener('mouseup',function(){{drag=false;resz=false;}});
-
 function getHeading(){{return window._pano?window._pano.getPov().heading:0;}}
-function getPitch(){{var cy=fy+fh/2;return(0.5-cy/window.innerHeight)*90;}}
-function getFov(){{return BASE_FOV*(fw/window.innerWidth);}}
-
+function getPitch(){{return window._pano?window._pano.getPov().pitch:0;}}
+function getFov(){{var z=window._pano?window._pano.getZoom():1;return Math.min(90/Math.pow(2,z-1),120);}}
+function getPanoId(){{return window._pano?window._pano.getPano():'';}}
 function initSV(){{
   window._pano=new google.maps.StreetViewPanorama(document.getElementById('sv'),{{
     position:{{lat:{latStr},lng:{lonStr}}},
@@ -208,7 +113,6 @@ function initSV(){{
     addressControl:false,fullscreenControl:false,
     motionTracking:false,motionTrackingControl:false
   }});
-  initFrame();
 }}
 </script>
 <script src='https://maps.googleapis.com/maps/api/js?key={key}&callback=initSV' async></script>
@@ -220,28 +124,30 @@ function initSV(){{
         private async void Capture_Click(object s, RoutedEventArgs e)
         {
             if (SelectedSection == null || !_webViewReady) return;
-            btnCapture.IsEnabled = false;
+            btnCapture.IsEnabled  = false;
             lblCaptureStatus.Text = "Downloading…";
-
             try
             {
-                string hStr = await webView.CoreWebView2.ExecuteScriptAsync("getHeading()");
-                string pStr = await webView.CoreWebView2.ExecuteScriptAsync("getPitch()");
-                string fStr = await webView.CoreWebView2.ExecuteScriptAsync("getFov()");
+                string hStr    = await webView.CoreWebView2.ExecuteScriptAsync("getHeading()");
+                string pStr    = await webView.CoreWebView2.ExecuteScriptAsync("getPitch()");
+                string fStr    = await webView.CoreWebView2.ExecuteScriptAsync("getFov()");
+                string panoRaw = await webView.CoreWebView2.ExecuteScriptAsync("getPanoId()");
 
                 double heading = double.Parse(hStr, CultureInfo.InvariantCulture);
                 double pitch   = double.Parse(pStr, CultureInfo.InvariantCulture);
                 double fov     = double.Parse(fStr, CultureInfo.InvariantCulture);
+                // JS returns a JSON string with surrounding quotes — strip them
+                string panoId  = panoRaw.Trim('"');
 
                 string savePath = Path.Combine(_folder, $"section_{SelectedSection.Id:D3}.jpg");
                 bool ok = await new StreetViewService().DownloadImageAsync(
-                    SelectedSection.Lat, SelectedSection.Lon, heading, pitch, fov, savePath);
+                    panoId, heading, pitch, fov, savePath);
 
                 if (ok)
                 {
                     SelectedSection.ImagePath = savePath;
-                    imgCapture.Source = TryLoadBitmap(savePath);
-                    lblCaptureStatus.Text =
+                    imgCapture.Source         = TryLoadBitmap(savePath);
+                    lblCaptureStatus.Text     =
                         $"Captured — heading {heading:F0}°  pitch {pitch:F1}°  fov {fov:F0}°";
                 }
                 else
@@ -261,8 +167,7 @@ function initSV(){{
 
         private void Thumbnail_Click(object s, System.Windows.Input.MouseButtonEventArgs e)
         {
-            if (e.ClickCount == 2)
-                ShowPreview(SelectedSection?.ImagePath);
+            if (e.ClickCount == 2) ShowPreview(SelectedSection?.ImagePath);
         }
 
         private void ShowPreview(string? path)
@@ -289,14 +194,15 @@ function initSV(){{
                 { Source = bi, Stretch = System.Windows.Media.Stretch.Uniform };
             var hint = new TextBlock
             {
-                Text = "Click anywhere or press Esc to close",
+                Text       = "Click anywhere or press Esc to close",
                 Foreground = System.Windows.Media.Brushes.White,
                 Background = new System.Windows.Media.SolidColorBrush(
                     System.Windows.Media.Color.FromArgb(160, 0, 0, 0)),
-                FontSize = 11, Padding = new Thickness(8, 4, 8, 4),
+                FontSize            = 11,
+                Padding             = new Thickness(8, 4, 8, 4),
                 HorizontalAlignment = HorizontalAlignment.Center,
                 VerticalAlignment   = VerticalAlignment.Bottom,
-                Margin = new Thickness(0, 0, 0, 10),
+                Margin              = new Thickness(0, 0, 0, 10),
             };
             var grid = new Grid();
             grid.Children.Add(img);
@@ -304,11 +210,12 @@ function initSV(){{
 
             var win = new Window
             {
-                Title  = "Street View — captured image",
-                Width  = 1000, Height = 650,
+                Title                 = "Street View — captured image",
+                Width                 = 1000, Height = 650,
                 WindowStartupLocation = WindowStartupLocation.CenterScreen,
-                Background = System.Windows.Media.Brushes.Black,
-                Content    = grid, ResizeMode = ResizeMode.CanResize,
+                Background            = System.Windows.Media.Brushes.Black,
+                Content               = grid,
+                ResizeMode            = ResizeMode.CanResize,
             };
             win.KeyDown             += (_, e2) => { if (e2.Key == System.Windows.Input.Key.Escape) win.Close(); };
             win.MouseLeftButtonDown += (_, _2) => win.Close();
@@ -322,16 +229,30 @@ function initSV(){{
         {
             if (lstSections.SelectedItem is not SectionInfo sec) return;
             SelectedSection = sec;
+
+            // Restore or default the preset selection for this section
+            string? saved = sec.SelectedPresetName ?? _presetNames.FirstOrDefault();
+            cmbPreset.SelectedItem = saved != null && _presetNames.Contains(saved)
+                ? saved
+                : _presetNames.FirstOrDefault();
+
             if (string.IsNullOrWhiteSpace(txtId.Text) || txtId.Text.StartsWith("Section "))
                 txtId.Text = sec.ToString();
 
-            imgCapture.Source = TryLoadBitmap(sec.ImagePath);
+            imgCapture.Source     = TryLoadBitmap(sec.ImagePath);
             lblCaptureStatus.Text = sec.ImagePath != null
                 ? "Previously captured — drag to re-capture if needed."
                 : "Drag to look around, then click Capture.";
 
             if (_webViewReady) LoadPanorama(sec);
             else _pendingSection = sec;
+        }
+
+        private void PresetChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (cmbPreset.SelectedItem is not string name) return;
+            if (SelectedSection != null)
+                SelectedSection.SelectedPresetName = name;
         }
 
         private static BitmapImage? TryLoadBitmap(string? path)
@@ -341,172 +262,94 @@ function initSV(){{
             {
                 var bi = new BitmapImage();
                 bi.BeginInit();
-                bi.UriSource   = new Uri(path);
-                bi.CacheOption = BitmapCacheOption.OnLoad;
+                bi.UriSource    = new Uri(path);
+                bi.CacheOption  = BitmapCacheOption.OnLoad;
+                bi.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
                 bi.EndInit();
                 return bi;
             }
             catch { return null; }
         }
 
-        // ── Zone type toggle ──────────────────────────────────────────────────
+        // ── Confirm ───────────────────────────────────────────────────────────
 
-        private void TypeChanged(object sender, RoutedEventArgs e)
-        {
-            if (!_initialized) return;
-            bool side = rbSide?.IsChecked == true;
-            RebuildButtons(side ? SideTypes   : FullTypes);
-            RebuildTypeCombo(side ? SideTypes : FullTypes);
-            ApplyPresets(side ? SidePresets   : FullPresets);
-        }
-
-        private void RebuildButtons(ZoneType[] types)
-        {
-            if (pnlButtons == null) return;
-            pnlButtons.Children.Clear();
-            foreach (var t in types)
-            {
-                var btn = new Button
-                {
-                    Content = ZoneMeta.Label(t), Tag = t,
-                    Margin  = new Thickness(0, 0, 5, 4),
-                    Padding = new Thickness(8, 3, 8, 3),
-                    MinWidth = 80,
-                };
-                btn.Click += AddZoneBtn_Click;
-                pnlButtons.Children.Add(btn);
-            }
-        }
-
-        private void RebuildTypeCombo(ZoneType[] types)
-        {
-            if (cmbType == null) return;
-            cmbType.ItemsSource   = types.Select(t => ZoneMeta.Label(t)).ToList();
-            cmbType.SelectedIndex = -1;
-        }
-
-        private void AddZoneBtn_Click(object sender, RoutedEventArgs e)
-        {
-            if (((Button)sender).Tag is not ZoneType t) return;
-            var z = new LayoutZone { Type = t, Width = ZoneMeta.DefaultWidth(t) };
-            _zones.Add(z);
-            lstZones.SelectedIndex = _zones.Count - 1;
-            lstZones.ScrollIntoView(z);
-        }
-
-        private void ApplyPresets(ZonePreset[] presets)
-        {
-            if (cmbPreset == null) return;
-            cmbPreset.ItemsSource   = presets;
-            cmbPreset.SelectedIndex = -1;
-            _zones.Clear();
-            RefreshList();
-        }
-
-        private void PresetChanged(object sender, SelectionChangedEventArgs e)
-        {
-            if (cmbPreset.SelectedItem is not ZonePreset p) return;
-            _zones.Clear();
-            foreach (var (t, w) in p.Zones)
-                _zones.Add(new LayoutZone { Type = t, Width = w });
-            RefreshList();
-            if (_zones.Count > 0) lstZones.SelectedIndex = 0;
-        }
-
-        // ── Zone editor ───────────────────────────────────────────────────────
-
-        private void LstZones_Changed(object s, SelectionChangedEventArgs e)
-        {
-            if (lstZones.SelectedItem is not LayoutZone z) return;
-            _sync = true;
-            bool side  = rbSide?.IsChecked == true;
-            var  types = side ? SideTypes : FullTypes;
-            cmbType.SelectedIndex = Array.IndexOf(types, z.Type);
-            txtWidth.Text = z.Width.ToString("0.##");
-            _sync = false;
-        }
-
-        private void TypeEditChanged(object sender, SelectionChangedEventArgs e)
-        {
-            if (_sync) return;
-            if (lstZones.SelectedItem is not LayoutZone z) return;
-            bool side  = rbSide?.IsChecked == true;
-            var  types = side ? SideTypes : FullTypes;
-            int  idx   = cmbType.SelectedIndex;
-            if (idx >= 0 && idx < types.Length) { z.Type = types[idx]; RefreshList(); }
-        }
-
-        private void WidthChanged(object sender, TextChangedEventArgs e)
-        {
-            if (_sync) return;
-            if (lstZones.SelectedItem is not LayoutZone z) return;
-            if (double.TryParse(txtWidth.Text.Replace(',', '.'),
-                    NumberStyles.Any, CultureInfo.InvariantCulture, out double w) && w > 0)
-            { z.Width = w; RefreshList(); }
-        }
-
-        private void RefreshList()
-        {
-            if (lstZones == null) return;
-            int i = lstZones.SelectedIndex;
-            lstZones.ItemsSource = null;
-            lstZones.ItemsSource = _zones;
-            lstZones.SelectedIndex = i;
-        }
-
-        private void Remove_Click(object s, RoutedEventArgs e)
-        {
-            int i = lstZones.SelectedIndex;
-            if (i < 0 || _zones.Count == 0) return;
-            _zones.RemoveAt(i);
-            lstZones.SelectedIndex = Math.Min(i, _zones.Count - 1);
-        }
-
-        private void Up_Click(object s, RoutedEventArgs e)
-        {
-            int i = lstZones.SelectedIndex;
-            if (i <= 0) return;
-            _zones.Move(i, i - 1);
-            lstZones.SelectedIndex = i - 1;
-        }
-
-        private void Down_Click(object s, RoutedEventArgs e)
-        {
-            int i = lstZones.SelectedIndex;
-            if (i < 0 || i >= _zones.Count - 1) return;
-            _zones.Move(i, i + 1);
-            lstZones.SelectedIndex = i + 1;
-        }
-
-        // ── Template / insertion point ────────────────────────────────────────
-
-
-        private void Draw_Click(object s, RoutedEventArgs e)
+        private void Append_Click(object s, RoutedEventArgs e)
         {
             if (string.IsNullOrWhiteSpace(txtId.Text))
             {
-                MessageBox.Show("Enter a cross-section ID (e.g. DD, CC').",
+                MessageBox.Show("Enter a cross-section ID (e.g. Section 001).",
                     "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
-            if (_zones.Count == 0)
+            if (cmbPreset.SelectedItem is not string preset)
             {
-                MessageBox.Show("Select a preset or add at least one zone.",
+                MessageBox.Show("Select a preset layout before continuing.",
                     "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
-            double x = 0, y = 0;
-            double.TryParse(txtInsX.Text.Replace(',', '.'), NumberStyles.Any,
-                CultureInfo.InvariantCulture, out x);
-            double.TryParse(txtInsY.Text.Replace(',', '.'), NumberStyles.Any,
-                CultureInfo.InvariantCulture, out y);
+            string id = txtId.Text.Trim();
+            // Prevent adding the same section ID twice
+            if (Queue.Any(q => q.SectionId.Equals(id, StringComparison.OrdinalIgnoreCase)))
+            {
+                MessageBox.Show($"'{id}' is already queued.",
+                    "Duplicate", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
 
-            SectionId = txtId.Text.Trim();
-            InsertX   = x;
-            InsertY   = y;
-            DialogResult = true;
+            Queue.Add(new QueueEntry(id, preset, SelectedSection?.ImagePath ?? "", SelectedSection?.StreetName ?? "",
+                SelectedSection?.ModelX ?? 0, SelectedSection?.ModelY ?? 0));
+            UpdateQueueStatus();
+
+            // Advance to next un-queued section automatically
+            var sections = lstSections.ItemsSource as System.Collections.IList;
+            if (sections != null)
+            {
+                int next = lstSections.SelectedIndex + 1;
+                if (next < sections.Count) lstSections.SelectedIndex = next;
+            }
         }
+
+        private void UpdateQueueStatus()
+        {
+            if (Queue.Count == 0)
+                lblQueueStatus.Text = "No sections queued yet.";
+            else
+                lblQueueStatus.Text = string.Join("\n", Queue.Select(q => $"✓ {q.SectionId}  [{q.PresetName}]"));
+            btnDone.IsEnabled = Queue.Count > 0;
+        }
+
+        private void AppendAll_Click(object s, RoutedEventArgs e)
+        {
+            if (cmbPreset.SelectedItem is not string preset)
+            {
+                MessageBox.Show("Select a preset layout before queuing all sections.",
+                    "Validation", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var sections = (lstSections.ItemsSource as IList<SectionInfo>) ?? new List<SectionInfo>(0);
+            int added = 0;
+            foreach (var sec in sections)
+            {
+                string id = sec.ToString();
+                if (Queue.Any(q => q.SectionId.Equals(id, StringComparison.OrdinalIgnoreCase)))
+                    continue;
+                // Use the section's individually saved preset if it has one, else the current selection
+                string sectionPreset = sec.SelectedPresetName ?? preset;
+                Queue.Add(new QueueEntry(id, sectionPreset, sec.ImagePath ?? "", sec.StreetName ?? "",
+                    sec.ModelX, sec.ModelY));
+                added++;
+            }
+            if (added == 0)
+                MessageBox.Show("All sections are already queued.", "Info",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+            else
+                UpdateQueueStatus();
+        }
+
+        private void Done_Click(object s, RoutedEventArgs e) =>
+            DialogResult = true;
 
         private void Cancel_Click(object s, RoutedEventArgs e) =>
             DialogResult = false;

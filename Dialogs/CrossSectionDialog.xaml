@@ -3,25 +3,24 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
         Title="Cross-Section Builder"
-        Width="860" Height="720"
-        MinWidth="700" MinHeight="580"
+        Width="960" Height="700"
+        MinWidth="760" MinHeight="520"
         WindowStartupLocation="CenterScreen">
     <Grid>
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="300" MinWidth="180" MaxWidth="600"/>
+            <ColumnDefinition Width="320" MinWidth="200" MaxWidth="480"/>
             <ColumnDefinition Width="5"/>
-            <ColumnDefinition Width="*" MinWidth="280"/>
+            <ColumnDefinition Width="*" MinWidth="300"/>
         </Grid.ColumnDefinitions>
 
         <!-- LEFT: section list + interactive panorama + capture -->
         <Grid Grid.Column="0" Margin="10,10,5,10">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition Height="100"/>
+                <RowDefinition Height="110"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition Height="90"/>
             </Grid.RowDefinitions>
 
             <TextBlock Grid.Row="0" Text="Cross-section points:"
@@ -32,30 +31,65 @@
 
             <TextBlock Grid.Row="2"
                        Text="Street View — drag to look around, then capture:"
-                       FontWeight="SemiBold" Margin="0,6,0,3" TextWrapping="Wrap"/>
+                       FontWeight="SemiBold" Margin="0,8,0,3" TextWrapping="Wrap"/>
 
-            <Border Grid.Row="3" BorderBrush="#AAAAAA" BorderThickness="1" MinHeight="180">
+            <Border Grid.Row="3" BorderBrush="#AAAAAA" BorderThickness="1" MinHeight="200">
                 <wv2:WebView2 x:Name="webView"/>
             </Border>
 
-            <StackPanel Grid.Row="4" Margin="0,5,0,3">
+            <StackPanel Grid.Row="4" Margin="0,6,0,0">
                 <Button x:Name="btnCapture" Content="Capture this view"
-                        Click="Capture_Click" Padding="6,5" IsEnabled="False"/>
+                        Click="Capture_Click" Padding="6,6" IsEnabled="False"/>
                 <TextBlock x:Name="lblCaptureStatus"
                            Text="Select a section to load the panorama"
                            FontSize="10" Foreground="#888"
-                           HorizontalAlignment="Center" Margin="0,3,0,0"
+                           HorizontalAlignment="Center" Margin="0,4,0,0"
                            TextWrapping="Wrap"/>
             </StackPanel>
+        </Grid>
 
-            <Border Grid.Row="5" BorderBrush="#AAAAAA" BorderThickness="1"
+        <GridSplitter Grid.Column="1" Width="5"
+                      HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                      Background="#DDDDDD" Cursor="SizeWE"/>
+
+        <!-- RIGHT: settings + captured thumbnail + queue status + buttons -->
+        <Grid Grid.Column="2" Margin="5,10,10,10">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" Text="Select cross-section layout"
+                       FontWeight="SemiBold" Margin="0,0,0,10"/>
+
+            <DockPanel Grid.Row="1" Margin="0,0,0,8">
+                <Label Content="Section ID:" DockPanel.Dock="Left"
+                       VerticalAlignment="Center" Width="85"/>
+                <TextBox x:Name="txtId" Padding="4,3" VerticalAlignment="Center"/>
+            </DockPanel>
+
+            <DockPanel Grid.Row="2" Margin="0,0,0,12">
+                <Label Content="Preset:" DockPanel.Dock="Left"
+                       VerticalAlignment="Center" Width="60"/>
+                <ComboBox x:Name="cmbPreset" SelectionChanged="PresetChanged"/>
+            </DockPanel>
+
+            <!-- Captured image thumbnail — landscape strip, double-click to preview -->
+            <Border Grid.Row="3"
+                    Height="160"
+                    BorderBrush="#AAAAAA" BorderThickness="1"
+                    Margin="0,0,0,10"
                     Cursor="Hand" MouseLeftButtonDown="Thumbnail_Click">
                 <Grid>
                     <Image x:Name="imgCapture" Stretch="Uniform"/>
-                    <TextBlock Text="Captured image will appear here"
+                    <TextBlock Text="Captured image will appear here&#x0a;Double-click to preview full size"
                                HorizontalAlignment="Center" VerticalAlignment="Center"
                                FontSize="10" Foreground="#AAAAAA" TextWrapping="Wrap"
-                               Margin="4">
+                               TextAlignment="Center" Margin="8">
                         <TextBlock.Style>
                             <Style TargetType="TextBlock">
                                 <Setter Property="Visibility" Value="Collapsed"/>
@@ -69,107 +103,27 @@
                     </TextBlock>
                 </Grid>
             </Border>
-        </Grid>
 
-        <GridSplitter Grid.Column="1" Width="5"
-                      HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
-                      Background="#DDDDDD" Cursor="SizeWE"/>
-
-        <!-- RIGHT: type, preset, zone builder -->
-        <Grid Grid.Column="2" Margin="5,10,10,10">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="*"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-
-            <!-- Cross-section ID -->
-            <DockPanel Grid.Row="0" Margin="0,0,0,8">
-                <Label Content="Cross-section ID:" DockPanel.Dock="Left"
-                       VerticalAlignment="Center" Width="120"/>
-                <TextBox x:Name="txtId" Padding="4,2" VerticalAlignment="Center"/>
-            </DockPanel>
-
-            <!-- Type -->
-            <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
-                <Label Content="Type:" VerticalAlignment="Center" Width="60"/>
-                <RadioButton x:Name="rbFull" Content="Full profile"
-                             VerticalAlignment="Center" Margin="0,0,16,0"
-                             IsChecked="True" Checked="TypeChanged"/>
-                <RadioButton x:Name="rbSide" Content="Side work"
-                             VerticalAlignment="Center" Checked="TypeChanged"/>
-            </StackPanel>
-
-            <!-- Preset -->
-            <DockPanel Grid.Row="2" Margin="0,0,0,8">
-                <Label Content="Preset:" DockPanel.Dock="Left"
-                       VerticalAlignment="Center" Width="60"/>
-                <ComboBox x:Name="cmbPreset" SelectionChanged="PresetChanged"/>
-            </DockPanel>
-
-            <!-- Zone type buttons -->
-            <WrapPanel x:Name="pnlButtons" Grid.Row="3" Margin="0,0,0,6"/>
-
-            <!-- Zone list -->
-            <ListBox x:Name="lstZones" Grid.Row="4"
-                     SelectionChanged="LstZones_Changed"
-                     FontFamily="Consolas" FontSize="12"
-                     Margin="0,0,0,4"/>
-
-            <!-- Edit selected zone -->
-            <Border Grid.Row="5" BorderBrush="#AAAAAA" BorderThickness="1"
-                    Padding="6,4" Margin="0,0,0,6" CornerRadius="3">
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="58"/>
-                    </Grid.ColumnDefinitions>
-                    <Label Grid.Column="0" Content="Type:" VerticalAlignment="Center" Width="46"/>
-                    <ComboBox x:Name="cmbType" Grid.Column="1" Margin="0,0,10,0"
-                              SelectionChanged="TypeEditChanged"/>
-                    <Label Grid.Column="2" Content="Width (m):" VerticalAlignment="Center"/>
-                    <TextBox x:Name="txtWidth" Grid.Column="3" Padding="4,2"
-                             TextChanged="WidthChanged"/>
-                </Grid>
+            <!-- Queue status -->
+            <Border Grid.Row="4" BorderBrush="#AAAAAA" BorderThickness="1"
+                    Padding="10" Margin="0,0,0,10" VerticalAlignment="Stretch">
+                <StackPanel>
+                    <TextBlock Text="Queue each section, then click Done to append all at once."
+                               FontSize="11" Foreground="#555" TextWrapping="Wrap" Margin="0,0,0,6"/>
+                    <TextBlock x:Name="lblQueueStatus"
+                               Text="No sections queued yet."
+                               FontSize="11" Foreground="#888" TextWrapping="Wrap"/>
+                </StackPanel>
             </Border>
 
-            <!-- Zone action buttons -->
-            <StackPanel Grid.Row="6" Orientation="Horizontal" Margin="0,0,0,8">
-                <Button Content="Remove" Width="65" Margin="0,0,5,0" Click="Remove_Click"/>
-                <Button Content="↑"     Width="30" Margin="0,0,4,0" Click="Up_Click"/>
-                <Button Content="↓"     Width="30"                  Click="Down_Click"/>
-            </StackPanel>
-
-            <!-- Insertion point -->
-            <Border Grid.Row="7" BorderBrush="#AAAAAA" BorderThickness="1"
-                    Padding="6,4" Margin="0,0,0,8" CornerRadius="3">
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="*"/>
-                    </Grid.ColumnDefinitions>
-                    <Label Grid.Column="0" Content="Insert at  X:" VerticalAlignment="Center"/>
-                    <TextBox x:Name="txtInsX" Grid.Column="1" Padding="4,2" Text="0"/>
-                    <Label Grid.Column="2" Content="  Y:" VerticalAlignment="Center"/>
-                    <TextBox x:Name="txtInsY" Grid.Column="3" Padding="4,2" Text="0"/>
-                </Grid>
-            </Border>
-
-            <!-- Draw / Cancel -->
-            <StackPanel Grid.Row="8" Orientation="Horizontal" HorizontalAlignment="Right">
-                <Button Content="Draw"   Width="80" Margin="0,0,8,0"
-                        IsDefault="True" Click="Draw_Click"/>
-                <Button Content="Cancel" Width="80" IsCancel="True"
+            <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button x:Name="btnQueue" Content="Queue section" Width="110" Margin="0,0,6,0"
+                        Click="Append_Click"/>
+                <Button x:Name="btnQueueAll" Content="Queue all" Width="90" Margin="0,0,6,0"
+                        Click="AppendAll_Click"/>
+                <Button x:Name="btnDone" Content="Done" Width="60" Margin="0,0,6,0"
+                        IsDefault="True" IsEnabled="False" Click="Done_Click"/>
+                <Button Content="Cancel" Width="60" IsCancel="True"
                         Click="Cancel_Click"/>
             </StackPanel>
         </Grid>

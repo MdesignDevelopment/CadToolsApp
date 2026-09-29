@@ -21,4 +21,11 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="CadToolsApp.Tests\**\*.cs" />
+    <None Remove="CadToolsApp.Tests\**\*" />
+    <Content Remove="CadToolsApp.Tests\**\*" />
+    <EmbeddedResource Remove="CadToolsApp.Tests\**\*" />
+  </ItemGroup>
 </Project>

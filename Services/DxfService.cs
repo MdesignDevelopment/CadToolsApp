@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -25,7 +25,12 @@ namespace CadToolsApp.Services
             return doc;
         }
 
-        public void Save(DxfDocument doc, string path) => doc.Save(path);
+        public void Save(DxfDocument doc, string path)
+        {
+            if (doc == null) throw new ArgumentNullException(nameof(doc));
+            doc.Entities.ActiveLayout = "Model";
+            doc.Save(path);
+        }
 
         // ── Find section points on SECTION_LAYER ───────────────────────────────
         public List<SectionInfo> FindSectionPoints(DxfDocument doc, string folder)
@@ -62,7 +67,7 @@ namespace CadToolsApp.Services
             foreach (var p in pts)
             {
                 var (lat, lon) = BelgianCrs.ToWgs84(p.x, p.y);
-                var sec = new SectionInfo(p.id, lat, lon);
+                var sec = new SectionInfo(p.id, lat, lon, p.x, p.y);
                 string imgPath = Path.Combine(folder, $"section_{p.id:D3}.jpg");
                 if (File.Exists(imgPath)) sec.ImagePath = imgPath;
                 result.Add(sec);
@@ -70,41 +75,476 @@ namespace CadToolsApp.Services
             return result;
         }
 
-        // ── Draw cross-section into doc ────────────────────────────────────────
-        public void DrawCrossSection(DxfDocument doc, string sectionId,
-            List<LayoutZone> zones, double ox, double oy,
-            string? layoutTemplatePath = null, string? iconsTemplatePath = null,
-            string? photoImagePath = null)
+        // ── Cross-section preset layouts ──────────────────────────────────────
+        // Returns the names of all paper-space layouts in the preset template.
+        // These are shown to the user as choices in CrossSectionDialog.
+        public List<string> GetPresetNames(string templatePath)
         {
-            var layer = EnsureLayer(doc, SECTION_LAYER, 7);
+            try
+            {
+                var src = DxfDocument.Load(templatePath);
+                return src.Layouts
+                    .Where(l => l.IsPaperSpace)
+                    .Select(l => l.Name)
+                    .ToList();
+            }
+            catch { return new List<string>(); }
+        }
 
-            // Photo area position defaults to "not set" (w=0 means skip)
-            var photoPos = Vector3.Zero;
-            double photoW = 0, photoH = 0;
+        // Clones the named paper-space layout from the preset template into the
+        // working document as a new layout tab named after the section ID.
+        public (bool ok, List<string> log) AppendPresetLayout(
+            DxfDocument doc, string templatePath, string presetName, string sectionId,
+            string? imagePath = null, string? address = null, string? dossierNumber = null,
+            double modelX = 0, double modelY = 0,
+            IReadOnlyDictionary<string, double>? cableLengths = null)
+        {
+            var log = new List<string>();
 
-            if (!string.IsNullOrEmpty(layoutTemplatePath) && File.Exists(layoutTemplatePath))
-                (photoPos, photoW, photoH) =
-                    InsertLayoutTemplate(doc, layer, layoutTemplatePath, ox, oy);
+            DxfDocument template;
+            try { template = DxfDocument.Load(templatePath); }
+            catch (Exception ex)
+            {
+                log.Add($"Cannot load template: {ex.Message}");
+                return (false, log);
+            }
 
-            if (!string.IsNullOrEmpty(iconsTemplatePath) && File.Exists(iconsTemplatePath))
-                ImportTemplateBlocks(doc, iconsTemplatePath);
+            var src = template.Layouts
+                .FirstOrDefault(l => l.IsPaperSpace &&
+                    l.Name.Equals(presetName, StringComparison.OrdinalIgnoreCase));
 
-            EnsureXsecBlocks(doc);
+            if (src == null)
+            {
+                log.Add($"Preset layout '{presetName}' not found in template.");
+                return (false, log);
+            }
 
-            DrawXsecView(doc, layer, ox, oy, sectionId, zones,
-                "Situatie vóór de werken");
+            string layoutName = MakeUniqueLayoutName(doc, sectionId);
+            var newLayout = new Layout(layoutName)
+            {
+                MinLimit = src.MinLimit,
+                MaxLimit = src.MaxLimit,
+            };
+            newLayout.PlotSettings.PaperSizeName          = src.PlotSettings.PaperSizeName;
+            newLayout.PlotSettings.PaperSize              = src.PlotSettings.PaperSize;
+            newLayout.PlotSettings.PaperUnits             = src.PlotSettings.PaperUnits;
+            newLayout.PlotSettings.PrintScaleNumerator    = src.PlotSettings.PrintScaleNumerator;
+            newLayout.PlotSettings.PrintScaleDenominator  = src.PlotSettings.PrintScaleDenominator;
+            newLayout.PlotSettings.ScaleToFit             = src.PlotSettings.ScaleToFit;
+            doc.Layouts.Add(newLayout);
 
-            const double LBL_Y_ABS   = 0.70;
-            const double ID_Y_OFF    = 6.80;
-            const double ID_TH_OFF   = 0.80;
-            const double SECTION_GAP = 2.5;
-            double gedY = oy - (LBL_Y_ABS + SECTION_GAP + ID_Y_OFF + ID_TH_OFF);
+            var visited = new Dictionary<string, Block>(StringComparer.OrdinalIgnoreCase);
+            int count   = 0;
+            foreach (var e in src.AssociatedBlock.Entities.ToList())
+            {
+                var cloned = CloneLayoutEntity(doc, e, visited, sectionId);
+                if (cloned == null) continue;
+                newLayout.AssociatedBlock.Entities.Add(cloned);
+                count++;
+            }
 
-            DrawXsecView(doc, layer, ox, gedY, sectionId, zones,
-                "Situatie gedurende de werken");
+            log.Add($"Layout '{layoutName}' appended -- {count} entities from '{presetName}'.");
 
-            if (!string.IsNullOrEmpty(photoImagePath) && File.Exists(photoImagePath) && photoW > 0)
-                TryInsertPhoto(doc, layer, photoImagePath, photoPos, photoW, photoH);
+            PatchDateFields(doc, newLayout, log);
+            PatchAddressField(doc, newLayout, address ?? "", log);
+            PatchDossierField(doc, newLayout, dossierNumber ?? "", log);
+
+            if (modelX != 0 || modelY != 0)
+                AddLiggingViewport(newLayout, modelX, modelY, log);
+
+            if (cableLengths != null && cableLengths.Count > 0)
+                PatchCableLengths(doc, newLayout, cableLengths, log);
+
+            if (!string.IsNullOrEmpty(imagePath) && File.Exists(imagePath))
+                AddPhotoToLayout(doc, newLayout, imagePath, log);
+
+            return (true, log);
+        }
+
+        private static EntityObject? CloneLayoutEntity(
+            DxfDocument doc, EntityObject e,
+            Dictionary<string, Block> visited, string sectionId)
+        {
+            EntityObject? result = e switch
+            {
+                Insert     ins => CloneInsertEntity(doc, ins, visited),
+                Viewport   vp  => CloneViewportEntity(vp),
+                Text       t   => new Text(ReplaceSectionId(t.Value, sectionId), t.Position, t.Height)
+                                  { Rotation = t.Rotation, Alignment = t.Alignment,
+                                    WidthFactor = t.WidthFactor, ObliqueAngle = t.ObliqueAngle, Color = t.Color },
+                MText      mt  => new MText(ReplaceSectionId(mt.Value, sectionId), mt.Position, mt.Height, mt.RectangleWidth)
+                                  { AttachmentPoint = mt.AttachmentPoint, Rotation = mt.Rotation, Color = mt.Color },
+                Line       l   => new Line(l.StartPoint, l.EndPoint)                        { Color = l.Color },
+                Circle     c   => new Circle(c.Center, c.Radius)                            { Color = c.Color },
+                Arc        a   => new Arc(a.Center, a.Radius, a.StartAngle, a.EndAngle)     { Color = a.Color },
+                Polyline2D p   => ClonePolyline2D(p),
+                Point            pt  => new Point(pt.Position)        { Color = pt.Color },
+                Image            img => CloneImageEntity(doc, img),
+                AlignedDimension dim => CloneAlignedDimension(doc, dim),
+                _                   => null,
+            };
+
+            if (result != null && e.Layer != null)
+                result.Layer = EnsureLayer(doc, e.Layer.Name, e.Layer.Color.Index);
+
+            return result;
+        }
+
+        private static Insert CloneInsertEntity(DxfDocument doc, Insert ins, Dictionary<string, Block> visited)
+        {
+            var block = CloneBlockIntoDocument(doc, ins.Block, visited);
+            return new Insert(block, ins.Position)
+            {
+                Scale      = ins.Scale,
+                Rotation   = ins.Rotation,
+                Color      = ins.Color,
+                Lineweight = ins.Lineweight,
+            };
+        }
+
+        private static Viewport CloneViewportEntity(Viewport vp) =>
+            new Viewport(new Vector2(vp.Center.X, vp.Center.Y), vp.Width, vp.Height)
+            {
+                ViewCenter = vp.ViewCenter,
+                ViewHeight = vp.ViewHeight,
+                Status     = vp.Status,
+            };
+
+        private static string ReplaceSectionId(string text, string sectionId) =>
+            Regex.Replace(text, @"Section\s+\d{3}", sectionId, RegexOptions.IgnoreCase);
+
+        private static string MakeUniqueLayoutName(DxfDocument doc, string sectionId)
+        {
+            string c = sectionId.Length > 240 ? sectionId[..240] : sectionId;
+            if (!doc.Layouts.Contains(c)) return c;
+            int n = 2;
+            while (doc.Layouts.Contains($"{c} ({n})")) n++;
+            return $"{c} ({n})";
+        }
+
+        private static Image? CloneImageEntity(DxfDocument doc, Image src)
+        {
+            if (src.Definition == null) return null;
+            if (!doc.ImageDefinitions.TryGetValue(src.Definition.Name, out var imgDef))
+            {
+                imgDef = new ImageDefinition(
+                    src.Definition.Name, src.Definition.File,
+                    src.Definition.Width, src.Definition.HorizontalResolution,
+                    src.Definition.Height, src.Definition.VerticalResolution,
+                    src.Definition.ResolutionUnits);
+                doc.ImageDefinitions.Add(imgDef);
+            }
+            return new Image(imgDef, src.Position, src.Width, src.Height)
+            {
+                Brightness = src.Brightness,
+                Contrast   = src.Contrast,
+                Fade       = src.Fade,
+                Color      = src.Color,
+            };
+        }
+
+        private static AlignedDimension CloneAlignedDimension(DxfDocument doc, AlignedDimension src)
+        {
+            // Use netDxf's own Clone() to preserve the anonymous geometry block
+            // (arrows, text, lines) that AutoCAD pre-renders for each dimension.
+            // Constructing a new AlignedDimension from scratch drops that block,
+            // causing wrong text/arrow sizes when the style settings differ.
+            var dim = (AlignedDimension)src.Clone();
+            dim.Style = EnsureDimensionStyle(doc, src.Style);
+            return dim;
+        }
+
+        private static DimensionStyle EnsureDimensionStyle(DxfDocument doc, DimensionStyle src)
+        {
+            // If a style with this name already exists but has different scale settings,
+            // using it would silently apply wrong proportions. Use a suffixed name instead.
+            string name = src.Name;
+            if (doc.DimensionStyles.TryGetValue(name, out var existing))
+            {
+                bool matches = Math.Abs(existing.DimScaleOverall - src.DimScaleOverall) < 0.001
+                            && Math.Abs(existing.TextHeight       - src.TextHeight)       < 0.001
+                            && Math.Abs(existing.ArrowSize        - src.ArrowSize)        < 0.001;
+                if (matches) return existing;
+                name = name + "_xs";
+                if (doc.DimensionStyles.TryGetValue(name, out var suffixed)) return suffixed;
+            }
+            var ds = new DimensionStyle(name)
+            {
+                ArrowSize       = src.ArrowSize,
+                DimScaleOverall = src.DimScaleOverall,
+                TextHeight      = src.TextHeight,
+                TextOffset      = src.TextOffset,
+                DimLineExtend   = src.DimLineExtend,
+                ExtLineOffset   = src.ExtLineOffset,
+                ExtLineExtend   = src.ExtLineExtend,
+                LengthPrecision = src.LengthPrecision,
+                DimScaleLinear  = src.DimScaleLinear,
+            };
+            return doc.DimensionStyles.Add(ds);
+        }
+
+        // Creates a paper-space viewport in the "Ligging:" cell showing model space
+        // centered on the section point. ViewHeight = 100 model units ≈ 100 m at Lambert72 scale.
+        private const double LiggingViewHeight = 100.0;
+
+        private static void AddLiggingViewport(Layout layout, double modelX, double modelY, List<string> log)
+        {
+            // Try direct search first, then search inside INSERT blocks (title block references).
+            var area = FindLiggingAreaRecursive(layout.AssociatedBlock, out double offX, out double offY, out double scale);
+            if (area == null)
+            {
+                log.Add("Ligging viewport skipped — 'Ligging:' cell not found in layout or its blocks.");
+                return;
+            }
+
+            var rect = area.Value;
+            // Apply INSERT offset and scale to get paper-space coordinates.
+            double paperCx = offX + (rect.Left + rect.Width  / 2.0) * scale;
+            double paperCy = offY + (rect.Bottom + rect.Height / 2.0) * scale;
+            double vpW     = rect.Width  * scale;
+            double vpH     = rect.Height * scale;
+
+            var vp = new netDxf.Entities.Viewport
+            {
+                Center     = new Vector3(paperCx, paperCy, 0),
+                Width      = vpW,
+                Height     = vpH,
+                ViewCenter = new Vector2(modelX, modelY),
+                ViewHeight = LiggingViewHeight,
+                Status     = netDxf.Entities.ViewportStatusFlags.CurrentlyAlwaysEnabled
+                           | netDxf.Entities.ViewportStatusFlags.FastZoom,
+            };
+
+            layout.AssociatedBlock.Entities.Add(vp);
+            log.Add($"Ligging viewport added at ({paperCx:F1},{paperCy:F1}) " +
+                    $"size {vpW:F1}×{vpH:F1} mm, " +
+                    $"model center ({modelX:F0},{modelY:F0}), view height {LiggingViewHeight} m.");
+        }
+
+        // Searches for the Ligging image area in the block itself, then recursively inside INSERTs.
+        // Returns the rect in the found block's local coordinates, plus the INSERT's offset and scale.
+        private static TitleBlockWriter.Rect? FindLiggingAreaRecursive(
+            Block block, out double offsetX, out double offsetY, out double uniformScale)
+        {
+            offsetX = 0; offsetY = 0; uniformScale = 1;
+
+            // Direct search in this block.
+            var direct = TitleBlockWriter.FindLiggingImageArea(block);
+            if (direct != null) return direct;
+
+            // Search inside INSERT entities.
+            foreach (var entity in block.Entities)
+            {
+                if (entity is not Insert ins) continue;
+                var found = TitleBlockWriter.FindLiggingImageArea(ins.Block);
+                if (found == null) continue;
+
+                // Apply the INSERT's 2-D transform (position + uniform scale).
+                double sx = Math.Abs(ins.Scale.X);
+                double sy = Math.Abs(ins.Scale.Y);
+                offsetX      = ins.Position.X;
+                offsetY      = ins.Position.Y;
+                uniformScale = (sx + sy) / 2.0;  // uniform scale assumed
+                return found;
+            }
+
+            return null;
+        }
+
+        private static void PatchDateFields(DxfDocument doc, Layout layout, List<string> log)
+        {
+            string today = DateTime.Today.ToString("dd/MM/yyyy");
+            var style = GetFabricomStyle(doc);
+            int patched = 0;
+            foreach (var entity in layout.AssociatedBlock.Entities)
+            {
+                if (entity is MText mt && mt.Value.Contains("DesignDate"))
+                {
+                    mt.Value = mt.Value.Replace("DesignDate", today);
+                    if (style != null) mt.Style = style;
+                    patched++;
+                }
+                else if (entity is Text t && t.Value.Contains("DesignDate"))
+                { t.Value = t.Value.Replace("DesignDate", today); patched++; }
+            }
+            if (patched > 0) log.Add($"Date field(s) set to {today} ({patched} entity/entities).");
+        }
+
+        private static void PatchAddressField(DxfDocument doc, Layout layout, string address, List<string> log)
+        {
+            log.Add($"PatchAddress: looking for 'ProjectAddress', address='{address}'.");
+            var style = GetFabricomStyle(doc);
+            int patched = PatchAddressInEntities(layout.AssociatedBlock.Entities, address, style);
+            log.Add(patched > 0
+                ? $"Address set to '{address}' ({patched} entity/entities)."
+                : "Address placeholder 'ProjectAddress' not found — check template MText.");
+        }
+
+        // Replaces cable-type placeholders (e.g. "DB7", "DB2") with formatted lengths.
+        // Supported placeholders: DB7, DB2, HDPE, COAX, EXISTING — case-sensitive, whole-word.
+        // Cable-length placeholders use the "Length" suffix to avoid colliding with type labels.
+        // Template text: DB7Length, DB2Length, HDPELength, COAXLength, EXISTINGLength, totalLength
+        private static readonly string[] CablePlaceholders =
+            ["DB7", "DB2", "HDPE", "COAX", "EXISTING"];
+
+        private static void PatchCableLengths(
+            DxfDocument doc, Layout layout,
+            IReadOnlyDictionary<string, double> lengths, List<string> log)
+        {
+            var style = GetFabricomStyle(doc);
+            int patched = 0;
+
+            var replacements = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            double total = 0;
+            foreach (var key in CablePlaceholders)
+            {
+                if (!lengths.TryGetValue(key, out double m)) continue;
+                replacements[$"{key}Length"] = $"{Math.Ceiling(m):0} m";
+                total += m;
+            }
+            if (total > 0)
+                replacements["totalLength"] = $"{Math.Ceiling(total):0} m";
+
+            foreach (var (placeholder, formatted) in replacements)
+            {
+                foreach (var entity in layout.AssociatedBlock.Entities)
+                {
+                    if (entity is MText mt && mt.Value.Contains(placeholder))
+                    { mt.Value = mt.Value.Replace(placeholder, formatted); mt.RectangleWidth = 0; if (style != null) mt.Style = style; patched++; }
+                    else if (entity is Text t && t.Value.Contains(placeholder))
+                    { t.Value = t.Value.Replace(placeholder, formatted); patched++; }
+                }
+            }
+            if (patched > 0) log.Add($"Cable lengths patched ({patched} entity/entities).");
+        }
+
+        private static void PatchDossierField(DxfDocument doc, Layout layout, string dossier, List<string> log)
+        {
+            var style = GetFabricomStyle(doc);
+            int patched = 0;
+            foreach (var entity in layout.AssociatedBlock.Entities)
+            {
+                if (entity is MText mt && mt.Value.Contains("DossierNumber"))
+                {
+                    mt.Value = mt.Value.Replace("DossierNumber", dossier);
+                    mt.RectangleWidth = 0;
+                    if (style != null) mt.Style = style;
+                    patched++;
+                }
+                else if (entity is Text t && t.Value.Contains("DossierNumber"))
+                { t.Value = t.Value.Replace("DossierNumber", dossier); patched++; }
+            }
+            if (patched > 0) log.Add($"Dossier number set to '{dossier}'.");
+        }
+
+        private static int PatchAddressInEntities(
+            IEnumerable<EntityObject> entities, string address, netDxf.Tables.TextStyle? style)
+        {
+            int patched = 0;
+            foreach (var entity in entities)
+            {
+                if (entity is MText mt && mt.Value.Contains("ProjectAddress"))
+                {
+                    mt.Value = mt.Value.Replace("ProjectAddress", address);
+                    mt.RectangleWidth = 0;  // disable word-wrap — keeps address on one line
+                    if (style != null) mt.Style = style;
+                    patched++;
+                }
+                else if (entity is Text t && t.Value.Contains("ProjectAddress"))
+                { t.Value = t.Value.Replace("ProjectAddress", address); patched++; }
+                else if (entity is Insert ins)
+                    patched += PatchAddressInEntities(ins.Block.Entities, address, style);
+            }
+            return patched;
+        }
+
+        // Returns the Fabricom-ISO text style from the document, or null if not present.
+        private static netDxf.Tables.TextStyle? GetFabricomStyle(DxfDocument doc)
+        {
+            foreach (var s in doc.TextStyles)
+                if (s.Name.Equals("Fabricom-ISO", StringComparison.OrdinalIgnoreCase))
+                    return s;
+            return null;
+        }
+
+        private static int PatchTextInEntities(
+            IEnumerable<EntityObject> entities, string placeholder, string value)
+        {
+            int patched = 0;
+            foreach (var entity in entities)
+            {
+                if (entity is MText mt && mt.Value.Contains(placeholder))
+                { mt.Value = mt.Value.Replace(placeholder, value); patched++; }
+                else if (entity is Text t && t.Value.Contains(placeholder))
+                { t.Value = t.Value.Replace(placeholder, value); patched++; }
+                else if (entity is Insert ins)
+                    patched += PatchTextInEntities(ins.Block.Entities, placeholder, value);
+            }
+            return patched;
+        }
+
+        private static void AddPhotoToLayout(
+            DxfDocument doc, Layout layout, string imagePath, List<string> log)
+        {
+            var (pxW, pxH) = ReadJpegDimensions(imagePath);
+            if (pxW <= 0 || pxH <= 0) { log.Add("Photo skipped: cannot read image dimensions."); return; }
+
+            double lw = layout.MaxLimit.X - layout.MinLimit.X;
+            double lh = layout.MaxLimit.Y - layout.MinLimit.Y;
+            if (lw <= 0 || lh <= 0) { log.Add("Photo skipped: invalid layout extents."); return; }
+
+            // Place photo to match the 176.8 × 85 mm strip (58.5% of layout width ≈ drawing area width).
+            // Height is proportional to the pixel aspect ratio of the downloaded image.
+            double imgW  = lw * 0.585;
+            double imgH  = imgW * (double)pxH / pxW;
+            double posX  = layout.MinLimit.X + lw * 0.01;
+            double posY  = layout.MinLimit.Y + lh * 0.03;
+
+            string defName = Path.GetFileNameWithoutExtension(imagePath);
+            if (doc.ImageDefinitions.TryGetValue(defName, out var existing))
+                defName = defName + "_" + Guid.NewGuid().ToString("N")[..6];
+
+            // Compute actual print DPI from placed size so AutoCAD plots at true resolution.
+            // imgW is in mm; convert to inches before dividing into pixel count.
+            double dpiH = pxW / (imgW / 25.4);
+            double dpiV = pxH / (imgH / 25.4);
+            var imgDef = new ImageDefinition(defName, imagePath,
+                pxW, dpiH, pxH, dpiV, ImageResolutionUnits.Inches);
+            doc.ImageDefinitions.Add(imgDef);
+
+            var img = new Image(imgDef, new Vector2(posX, posY), imgW, imgH)
+            {
+                Layer = EnsureLayer(doc, "PHOTO", AciColor.Default.Index),
+            };
+            layout.AssociatedBlock.Entities.Add(img);
+
+            log.Add($"Photo placed in '{layout.Name}' at ({posX:F1},{posY:F1}) size {imgW:F0}×{imgH:F0} mm.");
+        }
+
+        private static (int w, int h) ReadJpegDimensions(string path)
+        {
+            try
+            {
+                using var fs = File.OpenRead(path);
+                var buf = new byte[4];
+                if (fs.Read(buf, 0, 2) < 2 || buf[0] != 0xFF || buf[1] != 0xD8) return (0, 0);
+                while (fs.Position < fs.Length - 8)
+                {
+                    if (fs.Read(buf, 0, 2) < 2 || buf[0] != 0xFF) return (0, 0);
+                    byte marker = buf[1];
+                    if (fs.Read(buf, 0, 2) < 2) return (0, 0);
+                    int segLen = (buf[0] << 8) | buf[1];
+                    if (marker >= 0xC0 && marker <= 0xC3)
+                    {
+                        fs.ReadByte(); // precision byte
+                        if (fs.Read(buf, 0, 4) < 4) return (0, 0);
+                        return ((buf[2] << 8) | buf[3], (buf[0] << 8) | buf[1]);
+                    }
+                    fs.Seek(segLen - 2, SeekOrigin.Current);
+                }
+            }
+            catch { }
+            return (0, 0);
         }
 
         // ── Apply layer cleanup ────────────────────────────────────────────────
@@ -286,52 +726,6 @@ namespace CadToolsApp.Services
             return layer;
         }
 
-        private static void DrawXsecView(DxfDocument doc, Layer layer,
-            double ox, double oy, string sectionId, List<LayoutZone> zones, string title)
-        {
-            const double CELL_H   = 4.0;
-            const double DIM_H    = 4.8;
-            const double DIM_TICK = 0.15;
-            const double LBL_Y    = -0.70;
-            const double ID_Y     = 6.80;
-            const double TITLE_Y  = 5.90;
-            const double GND_EXT  = 0.50;
-            const double ID_TH    = 0.80;
-            const double TITLE_TH = 0.45;
-            const double LBL_TH   = 0.40;
-            const double DIM_TH   = 0.35;
-
-            double totalW = zones.Sum(z => z.Width);
-
-            AddLine(doc, layer, ox - GND_EXT, oy, ox + totalW + GND_EXT, oy);
-            AddLine(doc, layer, ox, oy + CELL_H, ox + totalW, oy + CELL_H);
-            AddLine(doc, layer, ox, oy, ox, oy + CELL_H);
-
-            double x = ox;
-            foreach (var zone in zones)
-            {
-                double x2 = x + zone.Width, cx = (x + x2) / 2.0;
-
-                AddLine(doc, layer, x2, oy, x2, oy + CELL_H);
-                AddLine(doc, layer, x, oy + DIM_H, x2, oy + DIM_H);
-                AddLine(doc, layer, x, oy + DIM_H - DIM_TICK, x, oy + DIM_H + DIM_TICK);
-                AddLine(doc, layer, x2, oy + DIM_H - DIM_TICK, x2, oy + DIM_H + DIM_TICK);
-
-                AddText(doc, layer, zone.Width.ToString("0.##"),
-                    cx, oy + DIM_H + 0.12, DIM_TH, center: true);
-
-                AddText(doc, layer, ZoneMeta.DrawingLabel(zone.Type),
-                    cx, oy + LBL_Y, LBL_TH, center: true);
-
-                InsertIcon(doc, layer, zone, cx, oy, CELL_H);
-
-                x = x2;
-            }
-
-            AddText(doc, layer, sectionId,  ox,       oy + ID_Y,    ID_TH,    center: false);
-            AddText(doc, layer, title,       ox + 2.0, oy + TITLE_Y, TITLE_TH, center: false);
-        }
-
         private static void AddLine(DxfDocument doc, Layer layer,
             double x1, double y1, double x2, double y2)
         {
@@ -353,241 +747,6 @@ namespace CadToolsApp.Services
             });
         }
 
-        private static void InsertIcon(DxfDocument doc, Layer layer,
-            LayoutZone zone, double cx, double groundY, double cellH)
-        {
-            string blockName = ZoneMeta.BlockName(zone.Type);
-            if (blockName == null || !doc.Blocks.Contains(blockName)) return;
-
-            var block = doc.Blocks[blockName];
-
-            Vector3 insertPt;
-            Vector3 scale;
-
-            if (ZoneMeta.IsWidthFill(zone.Type))
-            {
-                double bw = zone.Width, bh = cellH * 0.65;
-                insertPt = new Vector3(cx - bw / 2.0, groundY + cellH * 0.07, 0);
-                scale    = new Vector3(bw, bh, 1.0);
-            }
-            else
-            {
-                var (rw, rh) = ZoneMeta.IconRef(zone.Type);
-                double s = Math.Min(zone.Width * 0.80 / rw, cellH * 0.65 / rh);
-                insertPt = new Vector3(cx - rw * s / 2.0, groundY + (cellH - rh * s) / 2.0, 0);
-                scale    = new Vector3(s, s, 1.0);
-            }
-
-            doc.Entities.Add(new Insert(block, insertPt)
-            {
-                Scale = scale,
-                Layer = layer,
-            });
-        }
-
-        // ── Block definitions ─────────────────────────────────────────────────
-        private static void EnsureXsecBlocks(DxfDocument doc)
-        {
-            EnsureBlock(doc, "XSEC_BERM",       CreateBerm);
-            EnsureBlock(doc, "XSEC_BERM_TREES", CreateBermTrees);
-            EnsureBlock(doc, "XSEC_FIETSPAD",   CreateFietspad);
-            EnsureBlock(doc, "XSEC_VOETPAD",    (_) => { });
-            EnsureBlock(doc, "XSEC_RIJBAAN_F",  CreateRijbaan);
-            EnsureBlock(doc, "XSEC_RIJBAAN_B",  CreateRijbaanB);
-            EnsureBlock(doc, "XSEC_PARKING",    CreateParking);
-        }
-
-        private static void EnsureBlock(DxfDocument doc, string name,
-            Action<Block> populate)
-        {
-            if (doc.Blocks.Contains(name)) return;
-            var block = new Block(name);
-            populate(block);
-            doc.Blocks.Add(block);
-        }
-
-        private static void CreateBerm(Block b)
-        {
-            double[] xs = { 0.10, 0.28, 0.50, 0.68, 0.88 };
-            double[] hs = { 0.52, 0.64, 0.56, 0.66, 0.50 };
-            for (int i = 0; i < xs.Length; i++)
-            {
-                double bx = xs[i], h = hs[i];
-                b.Entities.Add(BLine(bx, 0, bx - 0.07, h));
-                b.Entities.Add(BLine(bx, 0, bx, h + 0.10));
-                b.Entities.Add(BLine(bx, 0, bx + 0.07, h));
-            }
-        }
-
-        private static void CreateBermTrees(Block b)
-        {
-            CreateBerm(b);
-            b.Entities.Add(BLine(0.50, 0.65, 0.50, 0.85));
-            b.Entities.Add(BLine(0.28, 0.65, 0.50, 0.95));
-            b.Entities.Add(BLine(0.72, 0.65, 0.50, 0.95));
-        }
-
-        private static void CreateFietspad(Block b)
-        {
-            const double wr = 0.36;
-            b.Entities.Add(new Circle(new Vector3(-0.60, wr, 0), wr));
-            b.Entities.Add(new Circle(new Vector3( 0.60, wr, 0), wr));
-            b.Entities.Add(BLine(-0.60, wr,   0.00, 0.52));
-            b.Entities.Add(BLine( 0.60, wr,   0.00, 0.52));
-            b.Entities.Add(BLine( 0.00, 0.52,-0.10, 1.08));
-            b.Entities.Add(BLine(-0.10, 1.08, 0.58, 0.88));
-            b.Entities.Add(BLine( 0.58, 0.88, 0.60, wr));
-            b.Entities.Add(BLine( 0.55, 0.88, 0.42, 0.96));
-            b.Entities.Add(BLine( 0.55, 0.88, 0.68, 0.94));
-            b.Entities.Add(BLine(-0.22, 1.10, 0.04, 1.10));
-        }
-
-        private static void CreateRijbaan(Block b)
-        {
-            const double wr = 0.22;
-            b.Entities.Add(new Circle(new Vector3(-0.75, wr, 0), wr));
-            b.Entities.Add(new Circle(new Vector3( 0.75, wr, 0), wr));
-            b.Entities.Add(BLine(-1.10, 0.28, 1.10, 0.28));
-            b.Entities.Add(BLine(-1.10, 0.28,-1.10, 0.85));
-            b.Entities.Add(BLine( 1.10, 0.28, 1.10, 0.85));
-            b.Entities.Add(BLine(-1.10, 0.85, 1.10, 0.85));
-            b.Entities.Add(BLine(-1.10, 0.85,-0.65, 1.38));
-            b.Entities.Add(BLine(-0.65, 1.38, 0.65, 1.38));
-            b.Entities.Add(BLine( 0.65, 1.38, 1.10, 0.85));
-            b.Entities.Add(BLine(-0.62, 0.87,-0.30, 1.34));
-            b.Entities.Add(BLine( 0.62, 0.87, 0.30, 1.34));
-        }
-
-        private static void CreateRijbaanB(Block b)
-        {
-            const double wr = 0.22;
-            b.Entities.Add(new Circle(new Vector3( 0.75, wr, 0), wr));
-            b.Entities.Add(new Circle(new Vector3(-0.75, wr, 0), wr));
-            b.Entities.Add(BLine( 1.10, 0.28,-1.10, 0.28));
-            b.Entities.Add(BLine( 1.10, 0.28, 1.10, 0.85));
-            b.Entities.Add(BLine(-1.10, 0.28,-1.10, 0.85));
-            b.Entities.Add(BLine( 1.10, 0.85,-1.10, 0.85));
-            b.Entities.Add(BLine( 1.10, 0.85, 0.65, 1.38));
-            b.Entities.Add(BLine( 0.65, 1.38,-0.65, 1.38));
-            b.Entities.Add(BLine(-0.65, 1.38,-1.10, 0.85));
-            b.Entities.Add(BLine( 0.62, 0.87, 0.30, 1.34));
-            b.Entities.Add(BLine(-0.62, 0.87,-0.30, 1.34));
-        }
-
-        private static void CreateParking(Block b)
-        {
-            // Vertical stem of P
-            b.Entities.Add(BLine(0.15, 0.00, 0.15, 1.40));
-            // Top horizontal
-            b.Entities.Add(BLine(0.15, 1.40, 0.65, 1.40));
-            // Right arc of P (approximated with lines)
-            b.Entities.Add(BLine(0.65, 1.40, 0.85, 1.20));
-            b.Entities.Add(BLine(0.85, 1.20, 0.85, 0.85));
-            b.Entities.Add(BLine(0.85, 0.85, 0.65, 0.70));
-            // Mid horizontal closing the bump
-            b.Entities.Add(BLine(0.65, 0.70, 0.15, 0.70));
-        }
-
-        private static Line BLine(double x1, double y1, double x2, double y2) =>
-            new Line(new Vector3(x1, y1, 0), new Vector3(x2, y2, 0));
-
-        // ── Insert layout template (frame, logo, title) at origin ─────────────
-        // Returns the photo area position and size found in the template via XSEC_PHOTO_AREA.
-        private static (Vector3 photoPos, double photoW, double photoH) InsertLayoutTemplate(
-            DxfDocument doc, Layer layer, string templatePath, double ox, double oy)
-        {
-            const string BLOCK_NAME = "XSEC_LAYOUT";
-            var photoPos = Vector3.Zero;
-            double photoW = 0, photoH = 0;
-
-            try
-            {
-                var src = DxfDocument.Load(templatePath);
-
-                // Find XSEC_PHOTO_AREA placeholder to get image position/size
-                foreach (var ins in src.Entities.Inserts)
-                {
-                    if (!ins.Block.Name.Equals("XSEC_PHOTO_AREA",
-                            StringComparison.OrdinalIgnoreCase)) continue;
-
-                    photoPos = new Vector3(ox + ins.Position.X, oy + ins.Position.Y, 0);
-                    photoW   = ins.Scale.X > 0 ? ins.Scale.X : 6.0;
-                    photoH   = ins.Scale.Y > 0 ? ins.Scale.Y : 4.0;
-                    break;
-                }
-
-                if (!doc.Blocks.Contains(BLOCK_NAME))
-                {
-                    var block = new Block(BLOCK_NAME);
-                    foreach (var e in src.Entities.All)
-                    {
-                        // Skip the placeholder — actual image replaces it
-                        if (e is Insert ins2 && ins2.Block.Name.Equals("XSEC_PHOTO_AREA",
-                                StringComparison.OrdinalIgnoreCase))
-                            continue;
-
-                        EntityObject? copy = e switch
-                        {
-                            Line l       => new Line(l.StartPoint, l.EndPoint),
-                            Circle c     => new Circle(c.Center, c.Radius),
-                            Arc a        => new Arc(a.Center, a.Radius, a.StartAngle, a.EndAngle),
-                            Polyline2D p => ClonePolyline2D(p),
-                            Text t       => new Text(t.Value, t.Position, t.Height)
-                                            { Alignment = t.Alignment, Rotation = t.Rotation },
-                            MText m      => new MText(m.Value, m.Position, m.Height, m.RectangleWidth),
-                            _            => null,
-                        };
-                        if (copy != null) block.Entities.Add(copy);
-                    }
-                    doc.Blocks.Add(block);
-                }
-
-                doc.Entities.Add(new Insert(doc.Blocks[BLOCK_NAME], new Vector3(ox, oy, 0))
-                {
-                    Layer = layer,
-                });
-            }
-            catch { /* skip on error */ }
-
-            return (photoPos, photoW, photoH);
-        }
-
-        // ── Insert captured street view image at the XSEC_PHOTO_AREA position ──
-        private static void TryInsertPhoto(DxfDocument doc, Layer layer,
-            string imagePath, Vector3 position, double w, double h)
-        {
-            try
-            {
-                string name = Path.GetFileNameWithoutExtension(imagePath);
-                if (!doc.ImageDefinitions.Contains(name))
-                {
-                    // 640×640 px @ 96 dpi matches StreetViewService image size
-                    var imgDef = new ImageDefinition(name, imagePath,
-                        640, 96.0, 640, 96.0, ImageResolutionUnits.Inches);
-                    doc.ImageDefinitions.Add(imgDef);
-                }
-
-                var img = new Image(doc.ImageDefinitions[name], position, w, h)
-                {
-                    Layer = layer,
-                };
-                doc.Entities.Add(img);
-            }
-            catch
-            {
-                // Fallback: rectangle with cross to mark where photo goes
-                double x = position.X, y = position.Y;
-                AddLine(doc, layer, x,     y,     x + w, y);
-                AddLine(doc, layer, x + w, y,     x + w, y + h);
-                AddLine(doc, layer, x + w, y + h, x,     y + h);
-                AddLine(doc, layer, x,     y + h, x,     y);
-                AddLine(doc, layer, x,     y,     x + w, y + h);
-                AddLine(doc, layer, x + w, y,     x,     y + h);
-                AddText(doc, layer, Path.GetFileName(imagePath),
-                    x + w / 2, y + h / 2, 0.25, center: true);
-            }
-        }
-
         private static Polyline2D ClonePolyline2D(Polyline2D src)
         {
             var verts = src.Vertexes.Select(v =>
@@ -595,35 +754,17 @@ namespace CadToolsApp.Services
             return new Polyline2D(verts) { IsClosed = src.IsClosed };
         }
 
-        // ── Import XSEC_ blocks from a DXF template ────────────────────────────
-        private static void ImportTemplateBlocks(DxfDocument doc, string templatePath)
+        private static EntityObject? CopyEntity(EntityObject e) => e switch
         {
-            try
-            {
-                var src = DxfDocument.Load(templatePath);
-                foreach (var srcBlock in src.Blocks)
-                {
-                    if (!srcBlock.Name.StartsWith("XSEC_",
-                        StringComparison.OrdinalIgnoreCase)) continue;
-                    if (doc.Blocks.Contains(srcBlock.Name)) continue;
-
-                    // Copy block geometry (Lines and Circles only)
-                    var newBlock = new Block(srcBlock.Name);
-                    foreach (var e in srcBlock.Entities)
-                    {
-                        EntityObject? copy = e switch
-                        {
-                            Line l  => new Line(l.StartPoint, l.EndPoint),
-                            Circle c => new Circle(c.Center, c.Radius),
-                            _       => null,
-                        };
-                        if (copy != null) newBlock.Entities.Add(copy);
-                    }
-                    doc.Blocks.Add(newBlock);
-                }
-            }
-            catch { /* skip on error */ }
-        }
+            Line       l => new Line(l.StartPoint, l.EndPoint),
+            Circle     c => new Circle(c.Center, c.Radius),
+            Arc        a => new Arc(a.Center, a.Radius, a.StartAngle, a.EndAngle),
+            Polyline2D p => ClonePolyline2D(p),
+            Text       t => new Text(t.Value, t.Position, t.Height)
+                            { Alignment = t.Alignment, Rotation = t.Rotation },
+            MText      m => new MText(m.Value, m.Position, m.Height, m.RectangleWidth),
+            _            => null,
+        };
 
         // ── FILLTABLE helpers ─────────────────────────────────────────────────
         private static readonly List<(string label, string key)> CableRows = new()
